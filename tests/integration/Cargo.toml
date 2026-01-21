@@ -1,0 +1,17 @@
+[package]
+name = "integration_tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+commitment_nft = { path = "../../contracts/commitment_nft" }
+commitment_core = { path = "../../contracts/commitment_core" }
+attestation_engine = { path = "../../contracts/attestation_engine" }
+
+[lib]
+crate-type = ["rlib"]
+
+[[test]]
+name = "integration"
+path = "src/lib.rs"

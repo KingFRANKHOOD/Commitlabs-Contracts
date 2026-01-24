@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Symbol, Address, Env, String, Vec, Map, 
+    contract, contractimpl, contracttype, symbol_short, Symbol, Address, Env, String, Vec, Map,
     IntoVal, TryIntoVal, Val,
 };
 
@@ -344,4 +344,3 @@ impl AttestationEngineContract {
 
 #[cfg(test)]
 mod tests;
-

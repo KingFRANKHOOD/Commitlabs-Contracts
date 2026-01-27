@@ -160,6 +160,7 @@ dependencies = [
 name = "commitment_core"
 version = "0.1.0"
 dependencies = [
+ "shared_utils",
  "soroban-sdk",
 ]
 
@@ -1065,6 +1066,13 @@ checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
 dependencies = [
  "digest",
  "keccak",
+]
+
+[[package]]
+name = "shared_utils"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]

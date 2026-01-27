@@ -1,8 +1,58 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Map, String, Symbol,
-    TryIntoVal, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Symbol, Address, Env, String, Vec, Map,
+    IntoVal, TryIntoVal, Val,
 };
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+/// Contract errors for structured error handling
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum AttestationError {
+    /// Contract has not been initialized
+    NotInitialized = 1,
+    /// Contract has already been initialized
+    AlreadyInitialized = 2,
+    /// Caller is not authorized to perform this action
+    Unauthorized = 3,
+    /// Invalid commitment ID
+    InvalidCommitmentId = 4,
+    /// Invalid attestation type (must be health_check, violation, fee_generation, or drawdown)
+    InvalidAttestationType = 5,
+    /// Invalid attestation data for the given type
+    InvalidAttestationData = 6,
+    /// Commitment not found in core contract
+    CommitmentNotFound = 7,
+    /// Storage operation failed
+    StorageError = 8,
+}
+
+// ============================================================================
+// Storage Keys
+// ============================================================================
+
+/// Storage keys for the contract
+#[contracttype]
+pub enum DataKey {
+    /// Admin address
+    Admin,
+    /// Core contract address
+    CoreContract,
+    /// Verifier whitelist (Address -> bool)
+    Verifier(Address),
+    /// Attestations for a commitment (commitment_id -> Vec<Attestation>)
+    Attestations(String),
+    /// Health metrics for a commitment (commitment_id -> HealthMetrics)
+    HealthMetrics(String),
+    /// Attestation counter for a commitment (commitment_id -> u64)
+    AttestationCounter(String),
+    /// Reentrancy guard
+    ReentrancyGuard,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,77 +129,226 @@ pub struct AttestationEngineContract;
 #[contractimpl]
 impl AttestationEngineContract {
     /// Initialize the attestation engine
-    pub fn initialize(e: Env, admin: Address, commitment_core: Address) {
-        e.storage().persistent().set(&DataKey::Admin, &admin);
-        e.storage()
-            .persistent()
-            .set(&DataKey::CommitmentCore, &commitment_core);
-        // Store admin and commitment core contract address in instance storage
-        e.storage().instance().set(&symbol_short!("ADMIN"), &admin);
-        e.storage()
-            .instance()
-            .set(&symbol_short!("CORE"), &commitment_core);
-    }
-
-    // ========================================================================
-    // Access Control
-    // ========================================================================
-
-    /// Add an authorized recorder (only admin can call)
-    pub fn add_authorized_recorder(e: Env, caller: Address, recorder: Address) {
-        caller.require_auth();
-
-        // Verify caller is admin
-        let admin: Address = e
-            .storage()
-            .instance()
-            .get(&symbol_short!("ADMIN"))
-            .unwrap_or_else(|| panic!("Contract not initialized"));
-
-        if caller != admin {
-            panic!("Unauthorized: only admin can add recorders");
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address for the contract
+    /// * `commitment_core` - The address of the commitment_core contract
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(AttestationError::AlreadyInitialized)` if already initialized
+    pub fn initialize(e: Env, admin: Address, commitment_core: Address) -> Result<(), AttestationError> {
+        // Check if already initialized
+        if e.storage().instance().has(&DataKey::Admin) {
+            return Err(AttestationError::AlreadyInitialized);
         }
 
-        // Add recorder to authorized list
-        let key = (symbol_short!("AUTHREC"), recorder.clone());
-        e.storage().instance().set(&key, &true);
+        // Store admin and commitment core contract address in instance storage
+        e.storage().instance().set(&DataKey::Admin, &admin);
+        e.storage().instance().set(&DataKey::CoreContract, &commitment_core);
 
-        // Emit event
-        e.events()
-            .publish((Symbol::new(&e, "RecorderAdded"),), (recorder,));
+        Ok(())
     }
 
-    /// Check if an address is authorized to record events
-    fn is_authorized_recorder(e: &Env, recorder: &Address) -> bool {
+    // ========================================================================
+    // Verifier Whitelist Management
+    // ========================================================================
+
+    /// Add a verifier to the whitelist
+    ///
+    /// # Arguments
+    /// * `caller` - Must be admin
+    /// * `verifier` - Address to add as authorized verifier
+    pub fn add_verifier(e: Env, caller: Address, verifier: Address) -> Result<(), AttestationError> {
+        caller.require_auth();
+
+        // Check caller is admin
+        let admin: Address = e.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AttestationError::NotInitialized)?;
+
+        if caller != admin {
+            return Err(AttestationError::Unauthorized);
+        }
+
+        // Add verifier to whitelist
+        e.storage().instance().set(&DataKey::Verifier(verifier.clone()), &true);
+
+        // Emit event
+        e.events().publish(
+            (Symbol::new(&e, "VerifierAdded"),),
+            (verifier,)
+        );
+
+        Ok(())
+    }
+
+    /// Remove a verifier from the whitelist
+    ///
+    /// # Arguments
+    /// * `caller` - Must be admin
+    /// * `verifier` - Address to remove from authorized verifiers
+    pub fn remove_verifier(e: Env, caller: Address, verifier: Address) -> Result<(), AttestationError> {
+        caller.require_auth();
+
+        // Check caller is admin
+        let admin: Address = e.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AttestationError::NotInitialized)?;
+
+        if caller != admin {
+            return Err(AttestationError::Unauthorized);
+        }
+
+        // Remove verifier from whitelist
+        e.storage().instance().remove(&DataKey::Verifier(verifier.clone()));
+
+        // Emit event
+        e.events().publish(
+            (Symbol::new(&e, "VerifierRemoved"),),
+            (verifier,)
+        );
+
+        Ok(())
+    }
+
+    /// Check if an address is an authorized verifier
+    fn is_authorized_verifier(e: &Env, address: &Address) -> bool {
         // Admin is always authorized
         if let Some(admin) = e
             .storage()
             .instance()
-            .get::<Symbol, Address>(&symbol_short!("ADMIN"))
+            .get::<DataKey, Address>(&DataKey::Admin)
         {
-            if *recorder == admin {
+            if *address == admin {
                 return true;
             }
         }
 
-        // Check if recorder is in authorized list
-        let key = (symbol_short!("AUTHREC"), recorder.clone());
-        e.storage().instance().get(&key).unwrap_or(false)
+        // Check verifier whitelist
+        e.storage()
+            .instance()
+            .get(&DataKey::Verifier(address.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Check if an address is a verifier (public version)
+    pub fn is_verifier(e: Env, address: Address) -> bool {
+        Self::is_authorized_verifier(&e, &address)
+    }
+
+    /// Get the admin address
+    pub fn get_admin(e: Env) -> Result<Address, AttestationError> {
+        e.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AttestationError::NotInitialized)
+    }
+
+    /// Get the core contract address
+    pub fn get_core_contract(e: Env) -> Result<Address, AttestationError> {
+        e.storage()
+            .instance()
+            .get(&DataKey::CoreContract)
+            .ok_or(AttestationError::NotInitialized)
+    }
+
+    /// Get stored health metrics for a commitment (without recalculation)
+    pub fn get_stored_health_metrics(e: Env, commitment_id: String) -> Option<HealthMetrics> {
+        let key = DataKey::HealthMetrics(commitment_id);
+        e.storage()
+            .persistent()
+            .get(&key)
     }
 
     // ========================================================================
-    // Health Metrics Storage Helpers
+    // Validation Helpers
     // ========================================================================
 
-    /// Load health metrics from storage or create new ones
-    fn load_or_create_health_metrics(e: &Env, commitment_id: &String) -> HealthMetrics {
-        let key = (symbol_short!("HEALTH"), commitment_id.clone());
+    /// Validate attestation type is one of the allowed types
+    fn is_valid_attestation_type(e: &Env, att_type: &String) -> bool {
+        let health_check = String::from_str(e, "health_check");
+        let violation = String::from_str(e, "violation");
+        let fee_generation = String::from_str(e, "fee_generation");
+        let drawdown = String::from_str(e, "drawdown");
 
-        if let Some(metrics) = e.storage().persistent().get(&key) {
-            metrics
+        *att_type == health_check || *att_type == violation ||
+        *att_type == fee_generation || *att_type == drawdown
+    }
+
+    /// Validate attestation data based on type
+    fn validate_attestation_data(e: &Env, att_type: &String, data: &Map<String, String>) -> bool {
+        let health_check = String::from_str(e, "health_check");
+        let violation = String::from_str(e, "violation");
+        let fee_generation = String::from_str(e, "fee_generation");
+        let drawdown = String::from_str(e, "drawdown");
+
+        if *att_type == health_check {
+            // health_check: optional fields, always valid
+            true
+        } else if *att_type == violation {
+            // violation: requires "violation_type" and "severity"
+            let violation_type_key = String::from_str(e, "violation_type");
+            let severity_key = String::from_str(e, "severity");
+            data.contains_key(violation_type_key) && data.contains_key(severity_key)
+        } else if *att_type == fee_generation {
+            // fee_generation: requires "fee_amount"
+            let fee_amount_key = String::from_str(e, "fee_amount");
+            data.contains_key(fee_amount_key)
+        } else if *att_type == drawdown {
+            // drawdown: requires "drawdown_percent"
+            let drawdown_percent_key = String::from_str(e, "drawdown_percent");
+            data.contains_key(drawdown_percent_key)
         } else {
-            // Create new metrics initialized to zero
-            HealthMetrics {
+            false
+        }
+    }
+
+    /// Check if commitment exists in core contract
+    fn commitment_exists(e: &Env, commitment_id: &String) -> bool {
+        let commitment_core: Address = match e.storage()
+            .instance()
+            .get(&DataKey::CoreContract)
+        {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        // Try to get commitment from core contract
+        let mut args = Vec::new(e);
+        args.push_back(commitment_id.clone().into_val(e));
+
+        // Use try_invoke_contract to handle potential failures
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+            &commitment_core,
+            &Symbol::new(e, "get_commitment"),
+            args,
+        );
+
+        match result {
+            Ok(Ok(_)) => true,
+            _ => false,
+        }
+    }
+
+    // ========================================================================
+    // Health Metrics Update
+    // ========================================================================
+
+    /// Update health metrics after an attestation
+    fn update_health_metrics(
+        e: &Env,
+        commitment_id: &String,
+        attestation: &Attestation,
+    ) {
+        // Get or create health metrics
+        let key = DataKey::HealthMetrics(commitment_id.clone());
+        let mut metrics: HealthMetrics = e.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| HealthMetrics {
                 commitment_id: commitment_id.clone(),
                 current_value: 0,
                 initial_value: 0,
@@ -157,49 +356,176 @@ impl AttestationEngineContract {
                 fees_generated: 0,
                 volatility_exposure: 0,
                 last_attestation: 0,
-                compliance_score: 100, // Start with perfect score
+                compliance_score: 100,
+            });
+
+        // Update last_attestation timestamp
+        metrics.last_attestation = attestation.timestamp;
+
+        // Update type-specific metrics
+        let fee_generation = String::from_str(e, "fee_generation");
+        let drawdown_type = String::from_str(e, "drawdown");
+        let violation = String::from_str(e, "violation");
+
+        if attestation.attestation_type == fee_generation {
+            // Add to fees_generated
+            let fee_amount_key = String::from_str(e, "fee_amount");
+            if let Some(fee_str) = attestation.data.get(fee_amount_key) {
+                // Parse fee amount from string
+                if let Some(fee_amount) = Self::parse_i128_from_string(e, &fee_str) {
+                    metrics.fees_generated = metrics.fees_generated
+                        .checked_add(fee_amount)
+                        .unwrap_or(metrics.fees_generated);
+                }
+            }
+        } else if attestation.attestation_type == drawdown_type {
+            // Update drawdown_percent
+            let drawdown_percent_key = String::from_str(e, "drawdown_percent");
+            if let Some(drawdown_str) = attestation.data.get(drawdown_percent_key) {
+                if let Some(drawdown_val) = Self::parse_i128_from_string(e, &drawdown_str) {
+                    metrics.drawdown_percent = drawdown_val;
+                }
+            }
+        } else if attestation.attestation_type == violation {
+            // Decrease compliance score for violations
+            let severity_key = String::from_str(e, "severity");
+            let penalty = if let Some(severity) = attestation.data.get(severity_key) {
+                let high = String::from_str(e, "high");
+                let medium = String::from_str(e, "medium");
+                if severity == high {
+                    30u32
+                } else if severity == medium {
+                    20u32
+                } else {
+                    10u32
+                }
+            } else {
+                20u32 // Default penalty
+            };
+
+            metrics.compliance_score = metrics.compliance_score.saturating_sub(penalty);
+        }
+
+        // Compliance bonus for compliant attestations
+        if attestation.is_compliant && attestation.attestation_type != violation {
+            // Small bonus for compliant attestations, capped at 100
+            metrics.compliance_score = core::cmp::min(100, metrics.compliance_score.saturating_add(1));
+        }
+
+        // Store updated metrics
+        e.storage().persistent().set(&key, &metrics);
+    }
+
+    /// Parse i128 from String (simple implementation)
+    fn parse_i128_from_string(_e: &Env, s: &String) -> Option<i128> {
+        let len = s.len();
+        if len == 0 {
+            return None;
+        }
+
+        // Copy string to buffer
+        let mut buf = [0u8; 64];
+        if len > 64 {
+            return None; // Too long
+        }
+        s.copy_into_slice(&mut buf[..len as usize]);
+
+        let mut result: i128 = 0;
+        let mut is_negative = false;
+        let mut start_idx = 0;
+
+        if buf[0] == b'-' {
+            is_negative = true;
+            start_idx = 1;
+        }
+
+        for i in start_idx..len as usize {
+            let b = buf[i];
+            if b >= b'0' && b <= b'9' {
+                result = result.checked_mul(10)?;
+                result = result.checked_add((b - b'0') as i128)?;
+            } else {
+                return None; // Invalid character
             }
         }
+
+        if is_negative {
+            result = result.checked_neg()?;
+        }
+
+        Some(result)
     }
 
-    /// Store health metrics
-    fn store_health_metrics(e: &Env, metrics: &HealthMetrics) {
-        let key = (symbol_short!("HEALTH"), metrics.commitment_id.clone());
-        e.storage().persistent().set(&key, metrics);
-    }
+    // ========================================================================
+    // Access Control
+    // ========================================================================
+
+
 
     /// Record an attestation for a commitment
+    ///
+    /// # Arguments
+    /// * `caller` - The address recording the attestation (must be authorized verifier)
+    /// * `commitment_id` - The commitment being attested
+    /// * `attestation_type` - Type: "health_check", "violation", "fee_generation", "drawdown"
+    /// * `data` - Type-specific data map
+    /// * `is_compliant` - Whether the commitment is compliant
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(AttestationError::*)` on various validation failures
     /// 
     /// # Reentrancy Protection
-    /// Uses checks-effects-interactions pattern. This function only writes to storage
-    /// and doesn't make external calls, but still protected for consistency.
+    /// Uses checks-effects-interactions pattern with an explicit guard.
     pub fn attest(
         e: Env,
+        caller: Address,
         commitment_id: String,
         attestation_type: String,
         data: Map<String, String>,
-        verified_by: Address,
-    ) {
-        // Reentrancy protection
-        let guard_key = symbol_short!("REENTRY");
-        let guard: bool = e.storage()
-            .instance()
-            .get(&guard_key)
-            .unwrap_or(false);
-        
-        if guard {
+        is_compliant: bool,
+    ) -> Result<(), AttestationError> {
+        // 1. Reentrancy protection
+        if e.storage().instance().has(&DataKey::ReentrancyGuard) {
             panic!("Reentrancy detected");
         }
-        e.storage().instance().set(&guard_key, &true);
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &true);
 
-        // CHECKS: Verify authorization
-        if !Self::is_authorized_recorder(&e, &verified_by) {
-            e.storage().instance().set(&guard_key, &false);
-            panic!("Unauthorized: caller is not an authorized recorder");
+        // 2. Verify caller signed the transaction
+        caller.require_auth();
+
+        // 3. Check caller is authorized verifier
+        if !Self::is_authorized_verifier(&e, &caller) {
+            e.storage().instance().remove(&DataKey::ReentrancyGuard);
+            return Err(AttestationError::Unauthorized);
         }
 
-        // EFFECTS: Update state
-        // Create attestation record
+        // 4. Validate commitment_id is not empty
+        if commitment_id.len() == 0 {
+            e.storage().instance().remove(&DataKey::ReentrancyGuard);
+            return Err(AttestationError::InvalidCommitmentId);
+        }
+
+        // 5. Validate commitment exists in core contract
+        if !Self::commitment_exists(&e, &commitment_id) {
+            e.storage().instance().remove(&DataKey::ReentrancyGuard);
+            return Err(AttestationError::CommitmentNotFound);
+        }
+
+        // 6. Validate attestation type
+        if !Self::is_valid_attestation_type(&e, &attestation_type) {
+            e.storage().instance().remove(&DataKey::ReentrancyGuard);
+            return Err(AttestationError::InvalidAttestationType);
+        }
+
+        // 7. Validate data format for the attestation type
+        if !Self::validate_attestation_data(&e, &attestation_type, &data) {
+            e.storage().instance().remove(&DataKey::ReentrancyGuard);
+            return Err(AttestationError::InvalidAttestationData);
+        }
+
+        // 8. Create attestation record
+        let timestamp = e.ledger().timestamp();
         let attestation = Attestation {
             commitment_id: commitment_id_clone,
             attestation_type: attestation_type_clone,
@@ -222,25 +548,47 @@ impl AttestationEngineContract {
 
         // Store updated list
         e.storage().persistent().set(&key, &attestations);
-        
-        // Clear reentrancy guard
-        e.storage().instance().set(&guard_key, &false);
-        
-        // Emit attestation event
+
+        // 10. Update health metrics
+        Self::update_health_metrics(&e, &commitment_id, &attestation);
+
+        // 11. Increment attestation counter
+        let counter_key = DataKey::AttestationCounter(commitment_id.clone());
+        let counter: u64 = e.storage()
+            .persistent()
+            .get(&counter_key)
+            .unwrap_or(0);
+        e.storage().persistent().set(&counter_key, &(counter + 1));
+
+        // 12. Emit enhanced AttestationRecorded event
         e.events().publish(
-            (symbol_short!("Attest"), commitment_id, verified_by),
-            (attestation_type, true, e.ledger().timestamp()),
+            (Symbol::new(&e, "AttestationRecorded"), commitment_id, caller),
+            (attestation_type, is_compliant, timestamp)
         );
+
+        // 13. Clear reentrancy guard
+        e.storage().instance().remove(&DataKey::ReentrancyGuard);
+
+        Ok(())
     }
 
     /// Get all attestations for a commitment
     pub fn get_attestations(e: Env, commitment_id: String) -> Vec<Attestation> {
         // Retrieve attestations from persistent storage using commitment_id as key
-        let key = (symbol_short!("ATTS"), commitment_id);
+        let key = DataKey::Attestations(commitment_id);
         e.storage()
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&e))
+    }
+
+    /// Get attestation count for a commitment
+    pub fn get_attestation_count(e: Env, commitment_id: String) -> u64 {
+        let key = DataKey::AttestationCounter(commitment_id);
+        e.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(0)
     }
 
     /// Get current health metrics for a commitment
@@ -255,8 +603,11 @@ impl AttestationEngineContract {
         let state = Self::get_health_state_or_default(&e, &commitment_id);
 
         // Get commitment from core contract
-        let commitment_core: Address = e.storage().instance().get(&symbol_short!("CORE")).unwrap();
-
+        let commitment_core: Address = e.storage()
+            .instance()
+            .get(&DataKey::CoreContract)
+            .unwrap();
+        
         // Call get_commitment on commitment_core contract
         // Using Symbol::new() for function name longer than 9 characters
         let mut args = Vec::new(&e);
@@ -378,54 +729,78 @@ impl AttestationEngineContract {
     /// Record fee generation
     ///
     /// # Arguments
-    /// * `caller` - The address calling this function (must be authorized)
-    /// * `commitment_id` - The commitment ID to record fees for
-    /// * `fee_amount` - The amount of fees generated
-    /// 
-    /// # Reentrancy Protection
-    /// Uses checks-effects-interactions pattern with reentrancy guard.
-    pub fn record_fees(e: Env, caller: Address, commitment_id: String, fee_amount: i128) {
-        // Reentrancy protection
-        let guard_key = symbol_short!("REENTRY");
-        let guard: bool = e.storage()
+    /// * `commitment_id` - The commitment to verify
+    ///
+    /// # Returns
+    /// `true` if compliant, `false` otherwise
+    pub fn verify_compliance(e: Env, commitment_id: String) -> bool {
+        // Get commitment from core contract
+        let commitment_core: Address = match e.storage()
             .instance()
-            .get(&guard_key)
-            .unwrap_or(false);
-        
-        if guard {
-            panic!("Reentrancy detected");
-        }
-        e.storage().instance().set(&guard_key, &true);
+            .get(&DataKey::CoreContract)
+        {
+            Some(addr) => addr,
+            None => return false,
+        };
 
-        // CHECKS: Verify caller authorization
-        caller.require_auth();
-        if !Self::is_authorized_recorder(&e, &caller) {
-            e.storage().instance().set(&guard_key, &false);
-            panic!("Unauthorized: caller is not an authorized recorder");
+        // Get commitment details
+        let mut args = Vec::new(&e);
+        args.push_back(commitment_id.clone().into_val(&e));
+        let commitment_val: Val = match e.try_invoke_contract::<Val, soroban_sdk::Error>(
+            &commitment_core,
+            &Symbol::new(&e, "get_commitment"),
+            args,
+        ) {
+            Ok(Ok(val)) => val,
+            _ => return false,
+        };
+
+        let commitment: Commitment = match commitment_val.try_into_val(&e) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        // Get health metrics
+        let metrics = Self::get_health_metrics(e.clone(), commitment_id);
+
+        // Check compliance rules
+        let max_loss = commitment.rules.max_loss_percent as i128;
+
+        // Check if drawdown exceeds max loss
+        if metrics.drawdown_percent > max_loss {
+            return false;
         }
 
-        // Validate fee amount
-        if fee_amount < 0 {
-            e.storage().instance().set(&guard_key, &false);
-            panic!("Invalid fee amount: must be non-negative");
+        // Check compliance score threshold (below 50 is non-compliant)
+        if metrics.compliance_score < 50 {
+            return false;
         }
-        
-        // EFFECTS: Update state before any external calls
-        // Load or create health metrics
-        let mut metrics = Self::load_or_create_health_metrics(&e, &commitment_id);
-        
-        // Update fees_generated
-        metrics.fees_generated = metrics.fees_generated.checked_add(fee_amount)
-            .unwrap_or_else(|| {
-                e.storage().instance().set(&guard_key, &false);
-                panic!("Fee amount overflow: cannot add {} to existing {}", fee_amount, metrics.fees_generated)
-            });
-        
-        // Create fee attestation
-        let data = Map::new(&e);
-        let attestation = Attestation {
-            commitment_id: commitment_id.clone(),
-            attestation_type: String::from_str(&e, "fee_generation"),
+
+        true
+    }
+
+    /// Record fee generation
+    ///
+    /// Convenience function that creates a fee_generation attestation
+    ///
+    /// # Arguments
+    /// * `caller` - Must be authorized verifier
+    /// * `commitment_id` - The commitment generating fees
+    /// * `fee_amount` - The fee amount generated
+    pub fn record_fees(e: Env, caller: Address, commitment_id: String, fee_amount: i128) -> Result<(), AttestationError> {
+        // Build data map for fee_generation attestation
+        let mut data = Map::new(&e);
+        data.set(
+            String::from_str(&e, "fee_amount"),
+            Self::i128_to_string(&e, fee_amount)
+        );
+
+        // Call attest with fee_generation type
+        Self::attest(
+            e.clone(),
+            caller,
+            commitment_id.clone(),
+            String::from_str(&e, "fee_generation"),
             data,
             timestamp: e.ledger().timestamp(),
             verified_by: caller.clone(),
@@ -459,54 +834,23 @@ impl AttestationEngineContract {
             (symbol_short!("FeeRec"), commitment_id),
             (fee_amount, e.ledger().timestamp()),
         );
+
+        Ok(())
     }
 
     /// Record drawdown event
     ///
     /// # Arguments
-    /// * `caller` - The address calling this function (must be authorized)
-    /// * `commitment_id` - The commitment ID to record drawdown for
-    /// * `current_value` - The current value of the commitment
-    /// 
-    /// # Reentrancy Protection
-    /// Uses checks-effects-interactions pattern with reentrancy guard.
-    /// External call to commitment_core is made before state updates.
-    pub fn record_drawdown(e: Env, caller: Address, commitment_id: String, current_value: i128) {
-        // Reentrancy protection
-        let guard_key = symbol_short!("REENTRY");
-        let guard: bool = e.storage()
-            .instance()
-            .get(&guard_key)
-            .unwrap_or(false);
-        
-        if guard {
-            panic!("Reentrancy detected");
-        }
-        e.storage().instance().set(&guard_key, &true);
-
-        // CHECKS: Verify caller authorization
-        caller.require_auth();
-        if !Self::is_authorized_recorder(&e, &caller) {
-            e.storage().instance().set(&guard_key, &false);
-            panic!("Unauthorized: caller is not an authorized recorder");
-        }
-
-        // Validate current_value
-        if current_value < 0 {
-            e.storage().instance().set(&guard_key, &false);
-            panic!("Invalid current value: must be non-negative");
-        }
-        
-        // INTERACTIONS: External call to get commitment (done early, before state changes)
-        // Get commitment from core contract to retrieve initial amount and max_loss_percent
+    /// * `caller` - Must be authorized verifier
+    /// * `commitment_id` - The commitment with drawdown
+    /// * `drawdown_percent` - The current drawdown percentage
+    pub fn record_drawdown(e: Env, caller: Address, commitment_id: String, drawdown_percent: i128) -> Result<(), AttestationError> {
+        // Get commitment to check max_loss_percent
         let commitment_core: Address = e.storage()
             .instance()
-            .get(&symbol_short!("CORE"))
-            .unwrap_or_else(|| {
-                e.storage().instance().set(&guard_key, &false);
-                panic!("Core contract not set")
-            });
-        
+            .get(&DataKey::CoreContract)
+            .ok_or(AttestationError::NotInitialized)?;
+
         let mut args = Vec::new(&e);
         args.push_back(commitment_id.clone().into_val(&e));
         let commitment_val: Val = e.invoke_contract(
@@ -514,6 +858,7 @@ impl AttestationEngineContract {
             &Symbol::new(&e, "get_commitment"),
             args,
         );
+
         let commitment: Commitment = commitment_val.try_into_val(&e)
             .unwrap_or_else(|_| {
                 e.storage().instance().set(&guard_key, &false);
@@ -612,6 +957,47 @@ impl AttestationEngineContract {
             (symbol_short!("Drawdown"), commitment_id),
             (current_value, drawdown_percent, e.ledger().timestamp()),
         );
+
+        Ok(())
+    }
+
+    /// Convert i128 to String (helper function)
+    fn i128_to_string(e: &Env, value: i128) -> String {
+        if value == 0 {
+            return String::from_str(e, "0");
+        }
+
+        let mut n = value;
+        let is_negative = n < 0;
+        if is_negative {
+            n = -n;
+        }
+
+        let mut buf = [0u8; 64];
+        let mut i = 0;
+
+        while n > 0 {
+            let digit = (n % 10) as u8 + b'0';
+            if i < 64 {
+                buf[i] = digit;
+                i += 1;
+            }
+            n /= 10;
+        }
+
+        if is_negative && i < 64 {
+            buf[i] = b'-';
+            i += 1;
+        }
+
+        // Reverse buffer
+        let len = i;
+        let mut result_buf = [0u8; 64];
+        for j in 0..len {
+            result_buf[j] = buf[len - 1 - j];
+        }
+
+        String::from_str(e, core::str::from_utf8(&result_buf[..len]).unwrap_or("0"))
     }
 
     /// Calculate compliance score (0-100)
@@ -633,6 +1019,15 @@ impl AttestationEngineContract {
     /// - SP-4: State consistency (read-only)
     /// - SP-3: Arithmetic safety
     pub fn calculate_compliance_score(e: Env, commitment_id: String) -> u32 {
+        // First check if we have stored metrics with a compliance score
+        let metrics_key = DataKey::HealthMetrics(commitment_id.clone());
+        if let Some(stored_metrics) = e.storage()
+            .persistent()
+            .get::<DataKey, HealthMetrics>(&metrics_key)
+        {
+            return stored_metrics.compliance_score;
+        }
+
         // Get commitment from core contract
         let commitment_core: Address = e.storage().instance().get(&symbol_short!("CORE")).unwrap();
 

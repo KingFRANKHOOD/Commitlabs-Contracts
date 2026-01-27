@@ -115,7 +115,7 @@ fn test_validate_rules_invalid_duration() {
 }
 
 #[test]
-#[should_panic(expected = "Invalid max loss percent")]
+#[should_panic(expected = "Invalid percent")]
 fn test_validate_rules_invalid_max_loss() {
     let e = Env::default();
     let contract_id = e.register_contract(None, CommitmentCoreContract);

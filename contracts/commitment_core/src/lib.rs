@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Env,
     IntoVal, String, Symbol, Vec,
 };
+use shared_utils::{SafeMath, TimeUtils, Validation};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -152,33 +153,17 @@ pub struct CommitmentCoreContract;
 
 #[contractimpl]
 impl CommitmentCoreContract {
-    /// Validate commitment rules
+    /// Validate commitment rules using shared utilities
     fn validate_rules(e: &Env, rules: &CommitmentRules) {
         // Duration must be > 0
-        if rules.duration_days == 0 {
-            log!(e, "Invalid duration: {}", rules.duration_days);
-            panic!("Invalid duration");
-        }
+        Validation::require_valid_duration(rules.duration_days);
 
         // Max loss percent must be between 0 and 100
-        if rules.max_loss_percent > 100 {
-            log!(e, "Invalid max loss percent: {}", rules.max_loss_percent);
-            panic!("Invalid max loss percent");
-        }
+        Validation::require_valid_percent(rules.max_loss_percent);
 
         // Commitment type must be valid
         let valid_types = ["safe", "balanced", "aggressive"];
-        let mut is_valid = false;
-        for valid_type in valid_types.iter() {
-            if rules.commitment_type == String::from_str(e, valid_type) {
-                is_valid = true;
-                break;
-            }
-        }
-        if !is_valid {
-            log!(e, "Invalid commitment type");
-            panic!("Invalid commitment type");
-        }
+        Validation::require_valid_commitment_type(e, &rules.commitment_type, &valid_types);
     }
 
     /// Generate unique commitment ID
@@ -260,12 +245,8 @@ impl CommitmentCoreContract {
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
 
-        // Validate amount > 0
-        if amount <= 0 {
-            set_reentrancy_guard(&e, false);
-            log!(&e, "Invalid amount: {}", amount);
-            panic!("Invalid amount");
-        }
+        // Validate amount > 0 using shared utilities
+        Validation::require_positive(amount);
 
         // Validate rules
         Self::validate_rules(&e, &rules);
@@ -290,9 +271,9 @@ impl CommitmentCoreContract {
         }
 
         // EFFECTS: Update state before external calls
-        // Calculate expiration timestamp (current time + duration in days)
-        let current_timestamp = e.ledger().timestamp();
-        let expires_at = current_timestamp + (rules.duration_days as u64 * 24 * 60 * 60); // days to seconds
+        // Calculate expiration timestamp using shared utilities
+        let current_timestamp = TimeUtils::now(&e);
+        let expires_at = TimeUtils::calculate_expiration(&e, rules.duration_days);
 
         // Create commitment data
         let commitment = Commitment {
@@ -451,12 +432,11 @@ impl CommitmentCoreContract {
         let current_time = e.ledger().timestamp();
 
         // Check loss limit violation
-        // Calculate loss percentage: ((amount - current_value) / amount) * 100
-        let loss_amount = commitment.amount - commitment.current_value;
+        // Calculate loss percentage using shared utilities, but handle zero-amount
+        // commitments gracefully to avoid panics. A zero-amount commitment cannot
+        // meaningfully violate a loss limit, so we treat its loss percent as 0.
         let loss_percent = if commitment.amount > 0 {
-            // Use i128 arithmetic to avoid overflow
-            // loss_percent = (loss_amount * 100) / amount
-            (loss_amount * 100) / commitment.amount
+            SafeMath::loss_percent(commitment.amount, commitment.current_value)
         } else {
             0
         };
@@ -617,10 +597,9 @@ impl CommitmentCoreContract {
             panic!("Commitment is not active");
         }
 
-        // EFFECTS: Calculate penalty and update state before external calls
-        let penalty_percent = commitment.rules.early_exit_penalty;
-        let penalty_amount = (commitment.current_value * penalty_percent as i128) / 100;
-        let returned_amount = commitment.current_value - penalty_amount;
+        // EFFECTS: Calculate penalty using shared utilities
+        let penalty_amount = SafeMath::penalty_amount(commitment.current_value, commitment.rules.early_exit_penalty);
+        let returned_amount = SafeMath::sub(commitment.current_value, penalty_amount);
 
         commitment.status = String::from_str(&e, "early_exit");
         set_commitment(&e, &commitment);

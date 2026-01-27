@@ -25,7 +25,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 950
+                    "lo": 5
                   }
                 }
               ]
@@ -301,7 +301,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "ATTS"
+                  "symbol": "AttestationCounter"
                 },
                 {
                   "string": "test_id"
@@ -321,7 +321,52 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "ATTS"
+                      "symbol": "AttestationCounter"
+                    },
+                    {
+                      "string": "test_id"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "u64": 1
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          4095
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "Attestations"
+                },
+                {
+                  "string": "test_id"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "Attestations"
                     },
                     {
                       "string": "test_id"
@@ -354,7 +399,24 @@
                             "symbol": "data"
                           },
                           "val": {
-                            "map": []
+                            "map": [
+                              {
+                                "key": {
+                                  "string": "drawdown_percent"
+                                },
+                                "val": {
+                                  "string": "5"
+                                }
+                              },
+                              {
+                                "key": {
+                                  "string": "max_loss_percent"
+                                },
+                                "val": {
+                                  "string": "10"
+                                }
+                              }
+                            ]
                           }
                         },
                         {
@@ -399,7 +461,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "HEALTH"
+                  "symbol": "HealthMetrics"
                 },
                 {
                   "string": "test_id"
@@ -419,7 +481,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "HEALTH"
+                      "symbol": "HealthMetrics"
                     },
                     {
                       "string": "test_id"
@@ -452,7 +514,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 950
+                          "lo": 0
                         }
                       }
                     },
@@ -485,7 +547,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 1000
+                          "lo": 0
                         }
                       }
                     },
@@ -542,7 +604,11 @@
                     "storage": [
                       {
                         "key": {
-                          "symbol": "ADMIN"
+                          "vec": [
+                            {
+                              "symbol": "Admin"
+                            }
+                          ]
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -550,10 +616,22 @@
                       },
                       {
                         "key": {
-                          "symbol": "CORE"
+                          "vec": [
+                            {
+                              "symbol": "CoreContract"
+                            }
+                          ]
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "REENTRY"
+                        },
+                        "val": {
+                          "bool": false
                         }
                       }
                     ]
@@ -619,7 +697,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 950
+                    "lo": 5
                   }
                 }
               ]
@@ -998,16 +1076,22 @@
           "v0": {
             "topics": [
               {
-                "symbol": "ScoreUpd"
+                "symbol": "AttestationRecorded"
               },
               {
                 "string": "test_id"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "u32": 100
+                  "string": "drawdown"
+                },
+                {
+                  "bool": true
                 },
                 {
                   "u64": 0
@@ -1028,7 +1112,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "Drawdown"
+                "symbol": "DrawdownRecorded"
               },
               {
                 "string": "test_id"
@@ -1039,14 +1123,11 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 950
+                    "lo": 5
                   }
                 },
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 5
-                  }
+                  "bool": true
                 },
                 {
                   "u64": 0

@@ -301,7 +301,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "ATTS"
+                  "symbol": "AttestationCounter"
                 },
                 {
                   "string": "test_id"
@@ -321,7 +321,52 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "ATTS"
+                      "symbol": "AttestationCounter"
+                    },
+                    {
+                      "string": "test_id"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "u64": 1
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          4095
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "Attestations"
+                },
+                {
+                  "string": "test_id"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "Attestations"
                     },
                     {
                       "string": "test_id"
@@ -354,7 +399,16 @@
                             "symbol": "data"
                           },
                           "val": {
-                            "map": []
+                            "map": [
+                              {
+                                "key": {
+                                  "string": "fee_amount"
+                                },
+                                "val": {
+                                  "string": "100"
+                                }
+                              }
+                            ]
                           }
                         },
                         {
@@ -399,7 +453,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "HEALTH"
+                  "symbol": "HealthMetrics"
                 },
                 {
                   "string": "test_id"
@@ -419,7 +473,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "HEALTH"
+                      "symbol": "HealthMetrics"
                     },
                     {
                       "string": "test_id"
@@ -542,7 +596,11 @@
                     "storage": [
                       {
                         "key": {
-                          "symbol": "ADMIN"
+                          "vec": [
+                            {
+                              "symbol": "Admin"
+                            }
+                          ]
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -550,10 +608,22 @@
                       },
                       {
                         "key": {
-                          "symbol": "CORE"
+                          "vec": [
+                            {
+                              "symbol": "CoreContract"
+                            }
+                          ]
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "REENTRY"
+                        },
+                        "val": {
+                          "bool": false
                         }
                       }
                     ]
@@ -818,16 +888,22 @@
           "v0": {
             "topics": [
               {
-                "symbol": "ScoreUpd"
+                "symbol": "AttestationRecorded"
               },
               {
                 "string": "test_id"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "u32": 100
+                  "string": "fee_generation"
+                },
+                {
+                  "bool": true
                 },
                 {
                   "u64": 0
@@ -848,7 +924,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "FeeRec"
+                "symbol": "FeeRecorded"
               },
               {
                 "string": "test_id"

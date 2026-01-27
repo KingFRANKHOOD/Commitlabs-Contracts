@@ -4,7 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, token, symbol_short, Address, Env, IntoVal, String,
     Symbol, Vec,
 };
-use shared_utils::{SafeMath, TimeUtils, Validation};
+use shared_utils::{SafeMath, TimeUtils, Validation, RateLimiter};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -68,7 +68,8 @@ pub enum DataKey {
     Commitment(String),        // commitment_id -> Commitment
     OwnerCommitments(Address), // owner -> Vec<commitment_id>
     TotalCommitments,          // counter
-    ReentrancyGuard,          // reentrancy protection flag
+    ReentrancyGuard,           // reentrancy protection flag
+    TotalValueLocked,          // aggregate value locked across active commitments
 }
 
 /// Transfer assets from owner to contract
@@ -147,6 +148,19 @@ fn set_reentrancy_guard(e: &Env, value: bool) {
     e.storage().instance().set(&DataKey::ReentrancyGuard, &value);
 }
 
+/// Require that the caller is the admin stored in this contract.
+fn require_admin(e: &Env, caller: &Address) {
+    caller.require_auth();
+    let admin = e
+        .storage()
+        .instance()
+        .get::<_, Address>(&DataKey::Admin)
+        .unwrap_or_else(|| panic!("Contract not initialized"));
+    if *caller != admin {
+        panic!("Unauthorized: only admin can perform this action");
+    }
+}
+
 #[contract]
 pub struct CommitmentCoreContract;
 
@@ -194,6 +208,11 @@ impl CommitmentCoreContract {
         e.storage()
             .instance()
             .set(&DataKey::TotalCommitments, &0u64);
+
+        // Initialize total value locked counter
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLocked, &0i128);
     }
 
     /// Create a new commitment
@@ -243,6 +262,10 @@ impl CommitmentCoreContract {
         // Reentrancy protection
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
+
+        // Rate limit: per-owner commitment creation
+        let fn_symbol = symbol_short!("create");
+        RateLimiter::check(&e, &owner, &fn_symbol);
 
         // Validate amount > 0 using shared utilities
         Validation::require_positive(amount);
@@ -313,6 +336,16 @@ impl CommitmentCoreContract {
             .instance()
             .set(&DataKey::TotalCommitments, &(current_total + 1));
 
+        // Update total value locked (aggregate)
+        let current_tvl = e
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLocked)
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLocked, &(current_tvl + amount));
+
         // INTERACTIONS: External calls (token transfer, NFT mint)
         // Transfer assets from owner to contract
         let contract_address = e.current_contract_address();
@@ -369,6 +402,14 @@ impl CommitmentCoreContract {
             .unwrap_or(0)
     }
 
+    /// Get total value locked across all active commitments.
+    pub fn get_total_value_locked(e: Env) -> i128 {
+        e.storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLocked)
+            .unwrap_or(0)
+    }
+
     /// Get admin address
     pub fn get_admin(e: Env) -> Address {
         e.storage()
@@ -387,10 +428,13 @@ impl CommitmentCoreContract {
 
     /// Update commitment value (called by allocation logic)
     pub fn update_value(e: Env, commitment_id: String, new_value: i128) {
-        // TODO: Verify caller is authorized (allocation contract)
-        // TODO: Update current_value
-        // TODO: Check if max_loss_percent is violated
-        
+        // Global per-function rate limit (per contract instance)
+        let fn_symbol = symbol_short!("upd_val");
+        let contract_address = e.current_contract_address();
+        RateLimiter::check(&e, &contract_address, &fn_symbol);
+
+        // NOTE: Authorization and value update logic can be extended here.
+
         // Emit value update event
         e.events().publish(
             (symbol_short!("ValUpd"), commitment_id),
@@ -531,6 +575,17 @@ impl CommitmentCoreContract {
         commitment.status = String::from_str(&e, "settled");
         set_commitment(&e, &commitment);
 
+        // Decrease total value locked
+        let current_tvl = e
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLocked)
+            .unwrap_or(0);
+        let new_tvl = current_tvl - settlement_amount;
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLocked, &new_tvl);
+
         // INTERACTIONS: External calls (token transfer, NFT settlement)
         // Transfer assets back to owner
         let contract_address = e.current_contract_address();
@@ -591,11 +646,23 @@ impl CommitmentCoreContract {
         }
 
         // EFFECTS: Calculate penalty using shared utilities
-        let penalty_amount = SafeMath::penalty_amount(commitment.current_value, commitment.rules.early_exit_penalty);
+        let penalty_amount =
+            SafeMath::penalty_amount(commitment.current_value, commitment.rules.early_exit_penalty);
         let returned_amount = SafeMath::sub(commitment.current_value, penalty_amount);
 
         commitment.status = String::from_str(&e, "early_exit");
         set_commitment(&e, &commitment);
+
+        // Decrease total value locked by full current value (no longer locked)
+        let current_tvl = e
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLocked)
+            .unwrap_or(0);
+        let new_tvl = current_tvl - commitment.current_value;
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLocked, &new_tvl);
 
         // INTERACTIONS: External calls (token transfer)
         // Transfer remaining amount (after penalty) to owner
@@ -621,6 +688,10 @@ impl CommitmentCoreContract {
         // Reentrancy protection
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
+
+        // Rate limit allocations per target pool address
+        let fn_symbol = symbol_short!("alloc");
+        RateLimiter::check(&e, &target_pool, &fn_symbol);
 
         // CHECKS: Validate inputs and commitment
         if amount <= 0 {
@@ -666,6 +737,28 @@ impl CommitmentCoreContract {
             (symbol_short!("Alloc"), commitment_id, target_pool),
             (amount, e.ledger().timestamp()),
         );
+    }
+
+    /// Configure rate limits for this contract's functions.
+    ///
+    /// This function is restricted to the contract admin.
+    pub fn set_rate_limit(
+        e: Env,
+        caller: Address,
+        function: Symbol,
+        window_seconds: u64,
+        max_calls: u32,
+    ) {
+        require_admin(&e, &caller);
+        RateLimiter::set_limit(&e, &function, window_seconds, max_calls);
+    }
+
+    /// Set or clear rate limit exemption for an address.
+    ///
+    /// This function is restricted to the contract admin.
+    pub fn set_rate_limit_exempt(e: Env, caller: Address, address: Address, exempt: bool) {
+        require_admin(&e, &caller);
+        RateLimiter::set_exempt(&e, &address, exempt);
     }
 }
 

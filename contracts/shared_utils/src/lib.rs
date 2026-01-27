@@ -11,6 +11,7 @@
 //! - Error helpers
 //! - Access control patterns
 //! - Event emission patterns
+//! - Rate limiting helpers
 
 pub mod math;
 pub mod time;
@@ -19,6 +20,7 @@ pub mod storage;
 pub mod errors;
 pub mod access_control;
 pub mod events;
+pub mod rate_limiting;
 
 #[cfg(test)]
 mod tests;
@@ -31,3 +33,4 @@ pub use storage::*;
 pub use errors::*;
 pub use access_control::*;
 pub use events::*;
+pub use rate_limiting::*;

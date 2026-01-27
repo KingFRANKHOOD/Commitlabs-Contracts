@@ -1280,6 +1280,113 @@ fn test_attest_event() {
 }
 
 #[test]
+#[should_panic(expected = "Rate limit exceeded")]
+fn test_attest_rate_limit_enforced() {
+    let (e, admin, _commitment_core, contract_id) = setup_test_env();
+
+    let verifier = admin.clone();
+
+    // Configure rate limit: 1 attestation per 60 seconds for function "attest"
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::set_rate_limit(
+            e.clone(),
+            admin.clone(),
+            Symbol::new(&e, "attest"),
+            60,
+            1,
+        ).unwrap();
+    });
+
+    let commitment_id = String::from_str(&e, "rl_attest");
+    let owner = Address::generate(&e);
+    store_core_commitment(
+        &e,
+        &_commitment_core,
+        "rl_attest",
+        &owner,
+        1000,
+        1000,
+        10,
+        30,
+        1000,
+    );
+
+    let attestation_type = String::from_str(&e, "health_check");
+    let data = Map::new(&e);
+
+    // First attestation should succeed
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::attest(
+            e.clone(),
+            verifier.clone(),
+            commitment_id.clone(),
+            attestation_type.clone(),
+            data.clone(),
+            true,
+        ).unwrap();
+    });
+
+    // Second attestation within same window should panic
+    e.as_contract(&contract_id, || {
+        let _ = AttestationEngineContract::attest(
+            e.clone(),
+            verifier.clone(),
+            commitment_id.clone(),
+            attestation_type.clone(),
+            data.clone(),
+            true,
+        );
+    });
+}
+
+#[test]
+fn test_protocol_statistics_aggregation() {
+    let (e, admin, _commitment_core, contract_id) = setup_test_env();
+    e.ledger().with_mut(|li| li.timestamp = 10000);
+
+    let commitment_id = String::from_str(&e, "stats_commitment");
+    let owner = Address::generate(&e);
+    store_core_commitment(
+        &e,
+        &_commitment_core,
+        "stats_commitment",
+        &owner,
+        1000,
+        1000,
+        10,
+        30,
+        1000,
+    );
+
+    // Record a fee generation attestation so that fees and counters update
+    let mut data = Map::new(&e);
+    data.set(String::from_str(&e, "fee_amount"), String::from_str(&e, "100"));
+
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::attest(
+            e.clone(),
+            admin.clone(),
+            commitment_id.clone(),
+            String::from_str(&e, "fee_generation"),
+            data,
+            true,
+        ).unwrap();
+    });
+
+    let (total_commitments, total_attestations, total_violations, total_fees) =
+        e.as_contract(&contract_id, || {
+            AttestationEngineContract::get_protocol_statistics(e.clone())
+        });
+
+    // We seeded a commitment directly in core storage; protocol stats read the
+    // core's aggregate counter which remains at zero in this isolated test.
+    assert_eq!(total_commitments, 0);
+    assert_eq!(total_attestations, 1);
+    assert_eq!(total_violations, 0);
+    assert_eq!(total_fees, 100);
+}
+
+#[test]
 fn test_record_fees_event() {
     let (e, admin, commitment_core, contract_id) = setup_test_env();
     e.mock_all_auths();

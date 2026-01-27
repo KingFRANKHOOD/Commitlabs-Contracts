@@ -3,8 +3,9 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, Address, Env, Map, Vec, 
-    symbol_short,
+    symbol_short, Symbol,
 };
+use shared_utils::RateLimiter;
 
 // ============================================================================
 // ERROR CODES - Error Handling
@@ -287,6 +288,10 @@ impl AllocationStrategiesContract {
         Self::require_initialized(&env)?;
         Self::require_no_reentrancy(&env)?;
 
+        // Rate limit allocations per caller address
+        let fn_symbol = symbol_short!("alloc");
+        RateLimiter::check(&env, &caller, &fn_symbol);
+
         // Set reentrancy guard
         Self::set_reentrancy_guard(&env, true);
 
@@ -400,6 +405,10 @@ impl AllocationStrategiesContract {
         caller.require_auth();
         Self::require_initialized(&env)?;
         Self::require_no_reentrancy(&env)?;
+
+        // Rate limit rebalancing per caller address
+        let fn_symbol = symbol_short!("rebal");
+        RateLimiter::check(&env, &caller, &fn_symbol);
 
         // Verify ownership
         let owner: Address = env.storage().persistent()
@@ -559,6 +568,41 @@ impl AllocationStrategiesContract {
         if admin != *address {
             return Err(Error::Unauthorized);
         }
+        Ok(())
+    }
+
+    /// Configure rate limits for this contract's core functions.
+    ///
+    /// Restricted to admin.
+    pub fn set_rate_limit(
+        env: Env,
+        admin: Address,
+        function: Symbol,
+        window_seconds: u64,
+        max_calls: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_initialized(&env)?;
+        Self::require_admin(&env, &admin)?;
+
+        RateLimiter::set_limit(&env, &function, window_seconds, max_calls);
+        Ok(())
+    }
+
+    /// Set or clear exemption from rate limits for an address.
+    ///
+    /// Restricted to admin.
+    pub fn set_rate_limit_exempt(
+        env: Env,
+        admin: Address,
+        address: Address,
+        exempt: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_initialized(&env)?;
+        Self::require_admin(&env, &admin)?;
+
+        RateLimiter::set_exempt(&env, &address, exempt);
         Ok(())
     }
 

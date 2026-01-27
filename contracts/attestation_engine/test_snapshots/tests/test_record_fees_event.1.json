@@ -283,6 +283,21 @@
                         "val": {
                           "u64": 0
                         }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TotalValueLocked"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 0
+                          }
+                        }
                       }
                     ]
                   }
@@ -620,10 +635,44 @@
                       },
                       {
                         "key": {
-                          "symbol": "REENTRY"
+                          "vec": [
+                            {
+                              "symbol": "TotalAttestations"
+                            }
+                          ]
                         },
                         "val": {
-                          "bool": false
+                          "u64": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TotalFees"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 100
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "VerifierAttestationCount"
+                            },
+                            {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 1
                         }
                       }
                     ]

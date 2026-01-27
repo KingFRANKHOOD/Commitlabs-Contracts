@@ -3,6 +3,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Symbol, Address, Env, String, Vec, Map,
     IntoVal, TryIntoVal, Val,
 };
+use shared_utils::RateLimiter;
 
 // ============================================================================
 // Error Types
@@ -52,6 +53,14 @@ pub enum DataKey {
     AttestationCounter(String),
     /// Reentrancy guard
     ReentrancyGuard,
+    /// Global analytics: total attestations recorded
+    TotalAttestations,
+    /// Global analytics: total violation-type or non-compliant attestations
+    TotalViolations,
+    /// Global analytics: total fees generated across all commitments
+    TotalFees,
+    /// Per-verifier analytics: attestation count by verifier
+    VerifierAttestationCount(Address),
 }
 
 #[contracttype]
@@ -356,6 +365,17 @@ impl AttestationEngineContract {
                     metrics.fees_generated = metrics.fees_generated
                         .checked_add(fee_amount)
                         .unwrap_or(metrics.fees_generated);
+
+                    // Update global total fees analytics
+                    let total_fees: i128 = e
+                        .storage()
+                        .instance()
+                        .get(&DataKey::TotalFees)
+                        .unwrap_or(0);
+                    let new_total = total_fees.checked_add(fee_amount).unwrap_or(total_fees);
+                    e.storage()
+                        .instance()
+                        .set(&DataKey::TotalFees, &new_total);
                 }
             }
         } else if attestation.attestation_type == drawdown_type {
@@ -480,6 +500,10 @@ impl AttestationEngineContract {
             return Err(AttestationError::Unauthorized);
         }
 
+        // 3b. Rate limit attestations per verifier
+        let fn_symbol = Symbol::new(&e, "attest");
+        RateLimiter::check(&e, &caller, &fn_symbol);
+
         // 4. Validate commitment_id is not empty
         if commitment_id.len() == 0 {
             e.storage().instance().remove(&DataKey::ReentrancyGuard);
@@ -535,6 +559,40 @@ impl AttestationEngineContract {
             .get(&counter_key)
             .unwrap_or(0);
         e.storage().persistent().set(&counter_key, &(counter + 1));
+
+        // 11b. Update global analytics counters
+        let total_attestations: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalAttestations)
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalAttestations, &(total_attestations + 1));
+
+        // Track violations (explicit or non-compliant)
+        let violation_type = String::from_str(&e, "violation");
+        if attestation.attestation_type == violation_type || !attestation.is_compliant {
+            let total_violations: u64 = e
+                .storage()
+                .instance()
+                .get(&DataKey::TotalViolations)
+                .unwrap_or(0);
+            e.storage()
+                .instance()
+                .set(&DataKey::TotalViolations, &(total_violations + 1));
+        }
+
+        // Track per-verifier attestation count
+        let verifier_key = DataKey::VerifierAttestationCount(caller.clone());
+        let verifier_count: u64 = e
+            .storage()
+            .instance()
+            .get(&verifier_key)
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&verifier_key, &(verifier_count + 1));
 
         // 12. Emit enhanced AttestationRecorded event
         e.events().publish(
@@ -989,6 +1047,111 @@ impl AttestationEngineContract {
         );
         
         score as u32
+    }
+
+    /// Get high-level protocol analytics combining commitment and attestation data.
+    ///
+    /// Returns:
+    /// - total_commitments (from core contract)
+    /// - total_attestations
+    /// - total_violations
+    /// - total_fees_generated
+    pub fn get_protocol_statistics(
+        e: Env,
+    ) -> (u64, u64, u64, i128) {
+        // Read commitment_core statistics
+        let commitment_core: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::CoreContract)
+            .unwrap();
+
+        // get_total_commitments() on core contract
+        let mut args = Vec::new(&e);
+        let total_commitments_val: Val = e.invoke_contract(
+            &commitment_core,
+            &Symbol::new(&e, "get_total_commitments"),
+            args,
+        );
+        let total_commitments: u64 = total_commitments_val
+            .try_into_val(&e)
+            .unwrap();
+
+        let total_attestations: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalAttestations)
+            .unwrap_or(0);
+        let total_violations: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalViolations)
+            .unwrap_or(0);
+        let total_fees: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalFees)
+            .unwrap_or(0);
+
+        (total_commitments, total_attestations, total_violations, total_fees)
+    }
+
+    /// Get analytics for a given verifier (attestation recorder).
+    ///
+    /// Returns the total number of attestations recorded by this verifier.
+    pub fn get_verifier_statistics(e: Env, verifier: Address) -> u64 {
+        let key = DataKey::VerifierAttestationCount(verifier);
+        e.storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(0)
+    }
+
+    /// Configure rate limits for this contract's functions (e.g. `attest`).
+    ///
+    /// Restricted to admin.
+    pub fn set_rate_limit(
+        e: Env,
+        caller: Address,
+        function: Symbol,
+        window_seconds: u64,
+        max_calls: u32,
+    ) -> Result<(), AttestationError> {
+        caller.require_auth();
+        let admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AttestationError::NotInitialized)?;
+        if caller != admin {
+            return Err(AttestationError::Unauthorized);
+        }
+
+        RateLimiter::set_limit(&e, &function, window_seconds, max_calls);
+        Ok(())
+    }
+
+    /// Set or clear rate limit exemption for a verifier.
+    ///
+    /// Restricted to admin.
+    pub fn set_rate_limit_exempt(
+        e: Env,
+        caller: Address,
+        verifier: Address,
+        exempt: bool,
+    ) -> Result<(), AttestationError> {
+        caller.require_auth();
+        let admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AttestationError::NotInitialized)?;
+        if caller != admin {
+            return Err(AttestationError::Unauthorized);
+        }
+
+        RateLimiter::set_exempt(&e, &verifier, exempt);
+        Ok(())
     }
 }
 

@@ -1,5 +1,6 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, Address, Env, String, Vec, Symbol};
+use shared_utils::{BatchMode, BatchResultVoid, BatchError, BatchProcessor};
 
 // ============================================================================
 // Error Types
@@ -67,6 +68,15 @@ pub struct CommitmentNFT {
     pub metadata: CommitmentMetadata,
     pub is_active: bool,
     pub early_exit_penalty: u32,
+}
+
+/// Parameters for batch NFT transfer operations
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferParams {
+    pub from: Address,
+    pub to: Address,
+    pub token_id: u32,
 }
 
 /// Storage keys for the contract
@@ -550,6 +560,192 @@ impl CommitmentNFTContract {
     /// Check if a token exists
     pub fn token_exists(e: Env, token_id: u32) -> bool {
         e.storage().persistent().has(&DataKey::NFT(token_id))
+    }
+
+    // ========================================================================
+    // Batch Operations
+    // ========================================================================
+
+    /// Batch transfer multiple NFTs in a single transaction
+    ///
+    /// # Arguments
+    /// * `params_list` - Vector of TransferParams for each transfer
+    /// * `mode` - BatchMode::Atomic or BatchMode::BestEffort
+    ///
+    /// # Returns
+    /// BatchResult with empty results and any errors
+    ///
+    /// # Gas Optimization
+    /// - Batch reads of NFT data
+    /// - Aggregate balance updates per owner (single write per owner)
+    /// - Batch owner list updates
+    pub fn batch_transfer(
+        e: Env,
+        params_list: Vec<TransferParams>,
+        mode: BatchMode,
+    ) -> BatchResultVoid {
+        // Reentrancy protection
+        let guard: bool = e.storage()
+            .instance()
+            .get(&DataKey::ReentrancyGuard)
+            .unwrap_or(false);
+
+        if guard {
+            let mut errors = Vec::new(&e);
+            errors.push_back(BatchError {
+                index: 0,
+                error_code: ContractError::ReentrancyDetected as u32,
+                context: String::from_str(&e, "reentrancy_detected"),
+            });
+            return BatchResultVoid::failure(&e, errors);
+        }
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+
+        // Validate batch size
+        let batch_size = params_list.len();
+        let contract_name = String::from_str(&e, "commitment_nft");
+        if let Err(error_code) = BatchProcessor::enforce_batch_limits(&e, batch_size, Some(contract_name)) {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+            let mut errors = Vec::new(&e);
+            errors.push_back(BatchError {
+                index: 0,
+                error_code,
+                context: String::from_str(&e, "batch_size_validation"),
+            });
+            return BatchResultVoid::failure(&e, errors);
+        }
+
+        let mut errors = Vec::new(&e);
+        let mut results = Vec::new(&e);
+
+        // Track balance changes per address (optimization)
+        use soroban_sdk::Map;
+        let mut balance_deltas: Map<Address, i32> = Map::new(&e);
+        let mut owner_tokens_updates: Map<Address, Vec<u32>> = Map::new(&e);
+
+        // Process each transfer
+        for i in 0..batch_size {
+            let params = params_list.get(i).unwrap();
+
+            // Require authorization from sender
+            params.from.require_auth();
+
+            // Get NFT
+            let mut nft: CommitmentNFT = match e.storage().persistent().get(&DataKey::NFT(params.token_id)) {
+                Some(nft) => nft,
+                None => {
+                    if mode == BatchMode::Atomic {
+                        e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+                        errors.push_back(BatchError {
+                            index: i,
+                            error_code: ContractError::TokenNotFound as u32,
+                            context: String::from_str(&e, "token_not_found"),
+                        });
+                        return BatchResultVoid::failure(&e, errors);
+                    } else {
+                        errors.push_back(BatchError {
+                            index: i,
+                            error_code: ContractError::TokenNotFound as u32,
+                            context: String::from_str(&e, "token_not_found"),
+                        });
+                        continue;
+                    }
+                }
+            };
+
+            // Verify ownership
+            if nft.owner != params.from {
+                if mode == BatchMode::Atomic {
+                    e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: ContractError::NotOwner as u32,
+                        context: String::from_str(&e, "not_owner"),
+                    });
+                    return BatchResultVoid::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: ContractError::NotOwner as u32,
+                        context: String::from_str(&e, "not_owner"),
+                    });
+                    continue;
+                }
+            }
+
+            // Update NFT owner
+            nft.owner = params.to.clone();
+            e.storage().persistent().set(&DataKey::NFT(params.token_id), &nft);
+
+            // Track balance changes (aggregate updates)
+            let from_delta = balance_deltas.get(params.from.clone()).unwrap_or(0) - 1;
+            balance_deltas.set(params.from.clone(), from_delta);
+
+            let to_delta = balance_deltas.get(params.to.clone()).unwrap_or(0) + 1;
+            balance_deltas.set(params.to.clone(), to_delta);
+
+            // Track owner token list updates
+            if !owner_tokens_updates.contains_key(params.from.clone()) {
+                let from_tokens: Vec<u32> = e.storage()
+                    .persistent()
+                    .get(&DataKey::OwnerTokens(params.from.clone()))
+                    .unwrap_or(Vec::new(&e));
+                owner_tokens_updates.set(params.from.clone(), from_tokens);
+            }
+
+            if !owner_tokens_updates.contains_key(params.to.clone()) {
+                let to_tokens: Vec<u32> = e.storage()
+                    .persistent()
+                    .get(&DataKey::OwnerTokens(params.to.clone()))
+                    .unwrap_or(Vec::new(&e));
+                owner_tokens_updates.set(params.to.clone(), to_tokens);
+            }
+
+            // Update token lists
+            let mut from_tokens = owner_tokens_updates.get(params.from.clone()).unwrap();
+            if let Some(index) = from_tokens.iter().position(|id| id == params.token_id) {
+                from_tokens.remove(index as u32);
+            }
+            owner_tokens_updates.set(params.from.clone(), from_tokens);
+
+            let mut to_tokens = owner_tokens_updates.get(params.to.clone()).unwrap();
+            to_tokens.push_back(params.token_id);
+            owner_tokens_updates.set(params.to.clone(), to_tokens);
+
+            results.push_back(());
+
+            // Emit transfer event
+            e.events().publish(
+                (symbol_short!("Transfer"), params.from.clone(), params.to.clone()),
+                (params.token_id, e.ledger().timestamp()),
+            );
+        }
+
+        // Apply balance changes (aggregate updates - optimization)
+        for (address, delta) in balance_deltas.iter() {
+            let current_balance: i32 = e.storage()
+                .persistent()
+                .get(&DataKey::OwnerBalance(address.clone()))
+                .unwrap_or(0) as i32;
+            let new_balance = (current_balance + delta).max(0) as u32;
+            e.storage().persistent().set(&DataKey::OwnerBalance(address), &new_balance);
+        }
+
+        // Apply owner token list updates
+        for (address, tokens) in owner_tokens_updates.iter() {
+            e.storage().persistent().set(&DataKey::OwnerTokens(address), &tokens);
+        }
+
+        // Clear reentrancy guard
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+
+        // Emit batch event
+        e.events().publish(
+            (Symbol::new(&e, "BatchTransfer"), batch_size),
+            (results.len(), errors.len(), e.ledger().timestamp()),
+        );
+
+        BatchResultVoid::partial(results.len(), errors)
     }
 }
 

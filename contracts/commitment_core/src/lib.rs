@@ -4,7 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, token, symbol_short, Address, Env, IntoVal, String,
     Symbol, Vec,
 };
-use shared_utils::{SafeMath, TimeUtils, Validation, RateLimiter, emit_error_event};
+use shared_utils::{SafeMath, TimeUtils, Validation, RateLimiter, emit_error_event, BatchMode, BatchResultString, BatchResultVoid, BatchError, BatchProcessor};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -93,6 +93,24 @@ pub struct Commitment {
     pub status: String, // "active", "settled", "violated", "early_exit"
 }
 
+/// Parameters for creating a commitment (used in batch operations)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateCommitmentParams {
+    pub owner: Address,
+    pub amount: i128,
+    pub asset_address: Address,
+    pub rules: CommitmentRules,
+}
+
+/// Parameters for updating commitment value (used in batch operations)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateValueParams {
+    pub commitment_id: String,
+    pub new_value: i128,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -131,6 +149,7 @@ fn call_nft_mint(
     commitment_type: &String,
     initial_amount: i128,
     asset_address: &Address,
+    early_exit_penalty: u32,
 ) -> u32 {
     let mut args = Vec::new(e);
     args.push_back(owner.clone().into_val(e));
@@ -140,6 +159,7 @@ fn call_nft_mint(
     args.push_back(commitment_type.clone().into_val(e));
     args.push_back(initial_amount.into_val(e));
     args.push_back(asset_address.clone().into_val(e));
+    args.push_back(early_exit_penalty.into_val(e));
 
     // In Soroban, contract calls return the value directly
     // Failures cause the entire transaction to fail
@@ -407,6 +427,7 @@ impl CommitmentCoreContract {
             &rules.commitment_type,
             amount,
             &asset_address,
+            rules.early_exit_penalty,
         );
 
         // Update commitment with NFT token ID
@@ -844,6 +865,528 @@ impl CommitmentCoreContract {
     pub fn set_rate_limit_exempt(e: Env, caller: Address, address: Address, exempt: bool) {
         require_admin(&e, &caller);
         RateLimiter::set_exempt(&e, &address, exempt);
+    }
+
+    // ========================================================================
+    // Batch Operations
+    // ========================================================================
+
+    /// Batch create multiple commitments in a single transaction
+    ///
+    /// # Arguments
+    /// * `params_list` - Vector of CreateCommitmentParams for each commitment
+    /// * `mode` - BatchMode::Atomic (all-or-nothing) or BatchMode::BestEffort (partial success)
+    ///
+    /// # Returns
+    /// BatchResult containing commitment IDs for successful operations and errors for failed ones
+    ///
+    /// # Gas Optimization
+    /// - Batch reads of storage values (counters, config)
+    /// - Aggregate counter updates (single write at end)
+    /// - Batch NFT minting when possible
+    /// - Single reentrancy guard for entire batch
+    pub fn batch_create_commitment(
+        e: Env,
+        params_list: Vec<CreateCommitmentParams>,
+        mode: BatchMode,
+    ) -> BatchResultString {
+        // Pre-flight checks
+        require_no_reentrancy(&e);
+        set_reentrancy_guard(&e, true);
+
+        let batch_size = params_list.len();
+
+        // Validate batch size
+        let contract_name = String::from_str(&e, "commitment_core");
+        if let Err(error_code) = BatchProcessor::enforce_batch_limits(&e, batch_size, Some(contract_name)) {
+            set_reentrancy_guard(&e, false);
+            let mut errors = Vec::new(&e);
+            errors.push_back(BatchError {
+                index: 0,
+                error_code,
+                context: String::from_str(&e, "batch_size_validation"),
+            });
+            return BatchResultString::failure(&e, errors);
+        }
+
+        // Read shared state once (optimization)
+        let (mut current_total, mut current_tvl, nft_contract) = {
+            let total = e.storage().instance().get::<_, u64>(&DataKey::TotalCommitments).unwrap_or(0);
+            let tvl = e.storage().instance().get::<_, i128>(&DataKey::TotalValueLocked).unwrap_or(0);
+            let nft = match e.storage().instance().get::<_, Address>(&DataKey::NftContract) {
+                Some(addr) => addr,
+                None => {
+                    set_reentrancy_guard(&e, false);
+                    let mut errors = Vec::new(&e);
+                    errors.push_back(BatchError {
+                        index: 0,
+                        error_code: CommitmentError::NotInitialized as u32,
+                        context: String::from_str(&e, "nft_contract_not_set"),
+                    });
+                    return BatchResultString::failure(&e, errors);
+                }
+            };
+            (total, tvl, nft)
+        };
+
+        let mut results = Vec::new(&e);
+        let mut errors = Vec::new(&e);
+        let mut created_commitments = Vec::new(&e); // Track for potential rollback
+
+        // Process each commitment
+        for i in 0..batch_size {
+            let params = params_list.get(i).unwrap();
+
+            // Validation pass
+            let validation_result = (|| {
+                // Validate amount
+                if params.amount <= 0 {
+                    return Err((CommitmentError::InvalidAmount as u32, "invalid_amount"));
+                }
+
+                // Validate rules
+                if params.rules.duration_days == 0 {
+                    return Err((CommitmentError::InvalidDuration as u32, "invalid_duration"));
+                }
+
+                if params.rules.max_loss_percent > 100 {
+                    return Err((CommitmentError::InvalidMaxLossPercent as u32, "invalid_max_loss"));
+                }
+
+                // Validate commitment type
+                let valid_types = ["safe", "balanced", "aggressive"];
+                let rules_type = params.rules.commitment_type.clone();
+                let mut is_valid_type = false;
+                for valid_type in valid_types.iter() {
+                    if rules_type == String::from_str(&e, valid_type) {
+                        is_valid_type = true;
+                        break;
+                    }
+                }
+                if !is_valid_type {
+                    return Err((CommitmentError::InvalidCommitmentType as u32, "invalid_type"));
+                }
+
+                Ok(())
+            })();
+
+            if let Err((error_code, context)) = validation_result {
+                if mode == BatchMode::Atomic {
+                    // Atomic mode: fail entire batch
+                    set_reentrancy_guard(&e, false);
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code,
+                        context: String::from_str(&e, context),
+                    });
+                    return BatchResultString::failure(&e, errors);
+                } else {
+                    // BestEffort mode: record error and continue
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code,
+                        context: String::from_str(&e, context),
+                    });
+                    continue;
+                }
+            }
+
+            // Generate commitment ID
+            let commitment_id = Self::generate_commitment_id(&e, current_total);
+            current_total += 1;
+
+            // Check balance before transfer
+            let token_client = token::Client::new(&e, &params.asset_address);
+            let balance = token_client.balance(&params.owner);
+            if balance < params.amount {
+                if mode == BatchMode::Atomic {
+                    set_reentrancy_guard(&e, false);
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::InsufficientBalance as u32,
+                        context: String::from_str(&e, "insufficient_balance"),
+                    });
+                    return BatchResultString::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::InsufficientBalance as u32,
+                        context: String::from_str(&e, "insufficient_balance"),
+                    });
+                    continue;
+                }
+            }
+
+            // Create commitment data
+            let current_timestamp = TimeUtils::now(&e);
+            let expires_at = TimeUtils::calculate_expiration(&e, params.rules.duration_days);
+
+            let commitment = Commitment {
+                commitment_id: commitment_id.clone(),
+                owner: params.owner.clone(),
+                nft_token_id: 0, // Will be set after NFT mint
+                rules: params.rules.clone(),
+                amount: params.amount,
+                asset_address: params.asset_address.clone(),
+                created_at: current_timestamp,
+                expires_at,
+                current_value: params.amount,
+                status: String::from_str(&e, "active"),
+            };
+
+            // Store commitment
+            set_commitment(&e, &commitment);
+
+            // Update owner's commitment list
+            let mut owner_commitments = e
+                .storage()
+                .instance()
+                .get::<_, Vec<String>>(&DataKey::OwnerCommitments(params.owner.clone()))
+                .unwrap_or(Vec::new(&e));
+            owner_commitments.push_back(commitment_id.clone());
+            e.storage().instance().set(
+                &DataKey::OwnerCommitments(params.owner.clone()),
+                &owner_commitments,
+            );
+
+            // Update TVL
+            current_tvl += params.amount;
+
+            // Transfer assets
+            let contract_address = e.current_contract_address();
+            token_client.transfer(&params.owner, &contract_address, &params.amount);
+
+            // Mint NFT
+            let nft_token_id = call_nft_mint(
+                &e,
+                &nft_contract,
+                &params.owner,
+                &commitment_id,
+                params.rules.duration_days,
+                params.rules.max_loss_percent,
+                &params.rules.commitment_type,
+                params.amount,
+                &params.asset_address,
+                params.rules.early_exit_penalty,
+            );
+
+            // Update commitment with NFT token ID
+            let mut updated_commitment = commitment;
+            updated_commitment.nft_token_id = nft_token_id;
+            set_commitment(&e, &updated_commitment);
+
+            // Track created commitment
+            created_commitments.push_back(commitment_id.clone());
+            results.push_back(commitment_id.clone());
+
+            // Emit event
+            e.events().publish(
+                (symbol_short!("Created"), commitment_id, params.owner.clone()),
+                (params.amount, params.rules.clone(), nft_token_id, current_timestamp),
+            );
+        }
+
+        // Update global counters (single write - optimization)
+        e.storage().instance().set(&DataKey::TotalCommitments, &current_total);
+        e.storage().instance().set(&DataKey::TotalValueLocked, &current_tvl);
+
+        // Clear reentrancy guard
+        set_reentrancy_guard(&e, false);
+
+        // Emit batch event
+        e.events().publish(
+            (symbol_short!("BatchCr"), batch_size),
+            (results.len(), errors.len(), e.ledger().timestamp()),
+        );
+
+        BatchResultString::partial(results, errors)
+    }
+
+    /// Batch update multiple commitment values in a single transaction
+    ///
+    /// # Arguments
+    /// * `params_list` - Vector of UpdateValueParams for each update
+    /// * `mode` - BatchMode::Atomic or BatchMode::BestEffort
+    ///
+    /// # Returns
+    /// BatchResultVoid with success count and any errors
+    pub fn batch_update_value(
+        e: Env,
+        params_list: Vec<UpdateValueParams>,
+        mode: BatchMode,
+    ) -> BatchResultVoid {
+        // Validate batch size
+        let batch_size = params_list.len();
+        let contract_name = String::from_str(&e, "commitment_core");
+        if let Err(error_code) = BatchProcessor::enforce_batch_limits(&e, batch_size, Some(contract_name)) {
+            let mut errors = Vec::new(&e);
+            errors.push_back(BatchError {
+                index: 0,
+                error_code,
+                context: String::from_str(&e, "batch_size_validation"),
+            });
+            return BatchResultVoid::failure(&e, errors);
+        }
+
+        let mut errors = Vec::new(&e);
+        let mut results = Vec::new(&e);
+        let mut tvl_delta: i128 = 0;
+
+        // Process each update
+        for i in 0..batch_size {
+            let params = params_list.get(i).unwrap();
+
+            // Validate new value
+            if params.new_value < 0 {
+                if mode == BatchMode::Atomic {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::InvalidAmount as u32,
+                        context: String::from_str(&e, "negative_value"),
+                    });
+                    return BatchResultVoid::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::InvalidAmount as u32,
+                        context: String::from_str(&e, "negative_value"),
+                    });
+                    continue;
+                }
+            }
+
+            // Get commitment
+            let mut commitment = match read_commitment(&e, &params.commitment_id) {
+                Some(c) => c,
+                None => {
+                    if mode == BatchMode::Atomic {
+                        errors.push_back(BatchError {
+                            index: i,
+                            error_code: CommitmentError::CommitmentNotFound as u32,
+                            context: String::from_str(&e, "commitment_not_found"),
+                        });
+                        return BatchResultVoid::failure(&e, errors);
+                    } else {
+                        errors.push_back(BatchError {
+                            index: i,
+                            error_code: CommitmentError::CommitmentNotFound as u32,
+                            context: String::from_str(&e, "commitment_not_found"),
+                        });
+                        continue;
+                    }
+                }
+            };
+
+            // Check if active
+            let active_status = String::from_str(&e, "active");
+            if commitment.status != active_status {
+                if mode == BatchMode::Atomic {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::NotActive as u32,
+                        context: String::from_str(&e, "not_active"),
+                    });
+                    return BatchResultVoid::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::NotActive as u32,
+                        context: String::from_str(&e, "not_active"),
+                    });
+                    continue;
+                }
+            }
+
+            // Calculate TVL delta
+            let old_value = commitment.current_value;
+            tvl_delta += params.new_value - old_value;
+
+            // Update commitment
+            commitment.current_value = params.new_value;
+            set_commitment(&e, &commitment);
+
+            results.push_back(());
+
+            // Emit event
+            e.events().publish(
+                (symbol_short!("ValUpd"), params.commitment_id.clone()),
+                (params.new_value, e.ledger().timestamp()),
+            );
+        }
+
+        // Update TVL once (optimization)
+        let current_tvl = e.storage().instance().get::<_, i128>(&DataKey::TotalValueLocked).unwrap_or(0);
+        e.storage().instance().set(&DataKey::TotalValueLocked, &(current_tvl + tvl_delta));
+
+        // Emit batch event
+        e.events().publish(
+            (symbol_short!("BatchUpd"), batch_size),
+            (results.len(), errors.len(), e.ledger().timestamp()),
+        );
+
+        BatchResultVoid::partial(results.len(), errors)
+    }
+
+    /// Batch settle multiple commitments in a single transaction
+    ///
+    /// # Arguments
+    /// * `commitment_ids` - Vector of commitment IDs to settle
+    /// * `mode` - BatchMode::Atomic or BatchMode::BestEffort
+    ///
+    /// # Returns
+    /// BatchResultVoid with success count and any errors
+    pub fn batch_settle(
+        e: Env,
+        commitment_ids: Vec<String>,
+        mode: BatchMode,
+    ) -> BatchResultVoid {
+        // Reentrancy protection
+        require_no_reentrancy(&e);
+        set_reentrancy_guard(&e, true);
+
+        // Validate batch size
+        let batch_size = commitment_ids.len();
+        let contract_name = String::from_str(&e, "commitment_core");
+        if let Err(error_code) = BatchProcessor::enforce_batch_limits(&e, batch_size, Some(contract_name)) {
+            set_reentrancy_guard(&e, false);
+            let mut errors = Vec::new(&e);
+            errors.push_back(BatchError {
+                index: 0,
+                error_code,
+                context: String::from_str(&e, "batch_size_validation"),
+            });
+            return BatchResultVoid::failure(&e, errors);
+        }
+
+        let mut errors = Vec::new(&e);
+        let mut results = Vec::new(&e);
+        let mut total_settled: i128 = 0;
+
+        // Get NFT contract address
+        let nft_contract = match e.storage().instance().get::<_, Address>(&DataKey::NftContract) {
+            Some(addr) => addr,
+            None => {
+                set_reentrancy_guard(&e, false);
+                let mut errors = Vec::new(&e);
+                errors.push_back(BatchError {
+                    index: 0,
+                    error_code: CommitmentError::NotInitialized as u32,
+                    context: String::from_str(&e, "nft_contract_not_set"),
+                });
+                return BatchResultVoid::failure(&e, errors);
+            }
+        };
+
+        let current_time = e.ledger().timestamp();
+
+        // Process each settlement
+        for i in 0..batch_size {
+            let commitment_id = commitment_ids.get(i).unwrap();
+
+            // Get commitment
+            let mut commitment = match read_commitment(&e, &commitment_id) {
+                Some(c) => c,
+                None => {
+                    if mode == BatchMode::Atomic {
+                        set_reentrancy_guard(&e, false);
+                        errors.push_back(BatchError {
+                            index: i,
+                            error_code: CommitmentError::CommitmentNotFound as u32,
+                            context: String::from_str(&e, "commitment_not_found"),
+                        });
+                        return BatchResultVoid::failure(&e, errors);
+                    } else {
+                        errors.push_back(BatchError {
+                            index: i,
+                            error_code: CommitmentError::CommitmentNotFound as u32,
+                            context: String::from_str(&e, "commitment_not_found"),
+                        });
+                        continue;
+                    }
+                }
+            };
+
+            // Verify commitment is expired
+            if current_time < commitment.expires_at {
+                if mode == BatchMode::Atomic {
+                    set_reentrancy_guard(&e, false);
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::NotExpired as u32,
+                        context: String::from_str(&e, "not_expired"),
+                    });
+                    return BatchResultVoid::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::NotExpired as u32,
+                        context: String::from_str(&e, "not_expired"),
+                    });
+                    continue;
+                }
+            }
+
+            // Verify commitment is active
+            let active_status = String::from_str(&e, "active");
+            if commitment.status != active_status {
+                if mode == BatchMode::Atomic {
+                    set_reentrancy_guard(&e, false);
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::NotActive as u32,
+                        context: String::from_str(&e, "not_active"),
+                    });
+                    return BatchResultVoid::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: CommitmentError::NotActive as u32,
+                        context: String::from_str(&e, "not_active"),
+                    });
+                    continue;
+                }
+            }
+
+            // Update state
+            let settlement_amount = commitment.current_value;
+            commitment.status = String::from_str(&e, "settled");
+            set_commitment(&e, &commitment);
+
+            total_settled += settlement_amount;
+
+            // Transfer assets back to owner
+            let contract_address = e.current_contract_address();
+            let token_client = token::Client::new(&e, &commitment.asset_address);
+            token_client.transfer(&contract_address, &commitment.owner, &settlement_amount);
+
+            // Mark NFT as settled
+            let mut args = Vec::new(&e);
+            args.push_back(commitment.nft_token_id.into_val(&e));
+            e.invoke_contract::<()>(&nft_contract, &Symbol::new(&e, "settle"), args);
+
+            results.push_back(());
+
+            // Emit event
+            e.events().publish(
+                (symbol_short!("Settled"), commitment_id),
+                (settlement_amount, current_time),
+            );
+        }
+
+        // Update TVL once (optimization)
+        let current_tvl = e.storage().instance().get::<_, i128>(&DataKey::TotalValueLocked).unwrap_or(0);
+        e.storage().instance().set(&DataKey::TotalValueLocked, &(current_tvl - total_settled));
+
+        // Clear reentrancy guard
+        set_reentrancy_guard(&e, false);
+
+        // Emit batch event
+        e.events().publish(
+            (symbol_short!("BatchSet"), batch_size),
+            (results.len(), errors.len(), current_time),
+        );
+
+        BatchResultVoid::partial(results.len(), errors)
     }
 }
 

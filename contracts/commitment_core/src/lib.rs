@@ -27,6 +27,7 @@ pub enum CommitmentError {
     InvalidStatus = 13,
     NotInitialized = 14,
     NotExpired = 15,
+    AssetNotSupported = 16,
 }
 
 impl CommitmentError {
@@ -48,6 +49,7 @@ impl CommitmentError {
             CommitmentError::InvalidStatus => "Invalid commitment status for this operation",
             CommitmentError::NotInitialized => "Contract not initialized",
             CommitmentError::NotExpired => "Commitment has not expired yet",
+            CommitmentError::AssetNotSupported => "Asset is not in the supported whitelist",
         }
     }
 }
@@ -80,6 +82,14 @@ pub struct CommitmentRules {
     pub min_fee_threshold: i128,
 }
 
+/// Metadata for a supported asset (symbol, decimals).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetMetadata {
+    pub symbol: String,
+    pub decimals: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Commitment {
@@ -105,6 +115,9 @@ pub enum DataKey {
     TotalCommitments,          // counter
     ReentrancyGuard,           // reentrancy protection flag
     TotalValueLocked,          // aggregate value locked across active commitments
+    SupportedAssets,          // Vec<Address> — whitelist; empty = allow all
+    AssetMetadata(Address),   // asset -> AssetMetadata (optional)
+    TotalValueLockedByAsset(Address), // asset -> i128
 }
 
 /// Transfer assets from owner to contract
@@ -189,6 +202,27 @@ fn set_reentrancy_guard(e: &Env, value: bool) {
     e.storage()
         .instance()
         .set(&DataKey::ReentrancyGuard, &value);
+}
+
+/// Require that the asset is in the supported whitelist (if whitelist is non-empty).
+fn require_asset_supported(e: &Env, asset_address: &Address) {
+    let supported = e
+        .storage()
+        .instance()
+        .get::<_, Vec<Address>>(&DataKey::SupportedAssets)
+        .unwrap_or(Vec::new(e));
+        if supported.len() > 0 {
+        let mut found = false;
+        for a in supported.iter() {
+            if a == *asset_address {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            fail(e, CommitmentError::AssetNotSupported, "require_asset_supported");
+        }
+    }
 }
 
 /// Require that the caller is the admin stored in this contract.
@@ -339,6 +373,9 @@ impl CommitmentCoreContract {
         // Validate rules
         Self::validate_rules(&e, &rules);
 
+        // Require asset is in supported whitelist (if whitelist is set)
+        require_asset_supported(&e, &asset_address);
+
         // OPTIMIZATION: Read both counters and NFT contract once to minimize storage operations
         let (current_total, current_tvl, nft_contract) = {
             let total = e
@@ -412,6 +449,16 @@ impl CommitmentCoreContract {
         e.storage()
             .instance()
             .set(&DataKey::TotalValueLocked, &(current_tvl + amount));
+
+        // Per-asset TVL tracking
+        let asset_tvl = e
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLockedByAsset(asset_address.clone()))
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLockedByAsset(asset_address.clone()), &(asset_tvl + amount));
 
         // INTERACTIONS: External calls (token transfer, NFT mint)
         // Transfer assets from owner to contract
@@ -517,6 +564,7 @@ impl CommitmentCoreContract {
         }
 
         let old_value = commitment.current_value;
+        let asset = commitment.asset_address.clone();
         commitment.current_value = new_value;
         set_commitment(&e, &commitment);
 
@@ -530,6 +578,16 @@ impl CommitmentCoreContract {
         e.storage()
             .instance()
             .set(&DataKey::TotalValueLocked, &new_tvl);
+
+        // Per-asset TVL
+        let asset_tvl = e
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLockedByAsset(asset.clone()))
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLockedByAsset(asset), &(asset_tvl - old_value + new_value));
 
         e.events().publish(
             (symbol_short!("ValUpd"), commitment_id),
@@ -689,6 +747,17 @@ impl CommitmentCoreContract {
             .instance()
             .set(&DataKey::TotalValueLocked, &new_tvl);
 
+        // Per-asset TVL
+        let asset = commitment.asset_address.clone();
+        let asset_tvl = e
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLockedByAsset(asset.clone()))
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLockedByAsset(asset), &(asset_tvl - settlement_amount));
+
         // INTERACTIONS: External calls (token transfer, NFT settlement)
         // Transfer assets back to owner
         let contract_address = e.current_contract_address();
@@ -745,12 +814,13 @@ impl CommitmentCoreContract {
             fail(&e, CommitmentError::NotActive, "early_exit");
         }
 
+        // Save original current value before updating (for TVL and transfers)
+        let original_current_value = commitment.current_value;
+
         // EFFECTS: Calculate penalty using shared utilities
-        let penalty_amount = SafeMath::penalty_amount(
-            commitment.current_value,
-            commitment.rules.early_exit_penalty,
-        );
-        let returned_amount = SafeMath::sub(commitment.current_value, penalty_amount);
+        let penalty_amount =
+            SafeMath::penalty_amount(original_current_value, commitment.rules.early_exit_penalty);
+        let returned_amount = SafeMath::sub(original_current_value, penalty_amount);
 
         // Update commitment status to early_exit
         commitment.status = String::from_str(&e, "early_exit");
@@ -763,10 +833,21 @@ impl CommitmentCoreContract {
             .instance()
             .get::<_, i128>(&DataKey::TotalValueLocked)
             .unwrap_or(0);
-        let new_tvl = current_tvl - commitment.current_value;
+        let new_tvl = current_tvl - original_current_value;
         e.storage()
             .instance()
             .set(&DataKey::TotalValueLocked, &new_tvl);
+
+        // Per-asset TVL
+        let asset = commitment.asset_address.clone();
+        let asset_tvl = e
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLockedByAsset(asset.clone()))
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLockedByAsset(asset), &(asset_tvl - original_current_value));
 
         // INTERACTIONS: External calls (token transfer)
         // Transfer remaining amount (after penalty) to owner
@@ -846,8 +927,27 @@ impl CommitmentCoreContract {
 
         // EFFECTS: Update commitment value before external call
         let mut updated_commitment = commitment;
+        let asset = updated_commitment.asset_address.clone();
         updated_commitment.current_value = updated_commitment.current_value - amount;
         set_commitment(&e, &updated_commitment);
+
+        // Decrease total value locked and per-asset TVL
+        let current_tvl = e
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLocked)
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLocked, &(current_tvl - amount));
+        let asset_tvl = e
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLockedByAsset(asset.clone()))
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLockedByAsset(asset), &(asset_tvl - amount));
 
         // INTERACTIONS: External call (token transfer)
         // Transfer assets to target pool
@@ -1010,6 +1110,97 @@ impl CommitmentCoreContract {
             (symbol_short!("EmgUpd"), commitment_id),
             (e.ledger().timestamp(),),
         );
+    }
+
+    // ========== Multi-asset support ==========
+
+    /// Get the list of supported assets (whitelist). Empty = allow all assets.
+    pub fn get_supported_assets(e: Env) -> Vec<Address> {
+        e.storage()
+            .instance()
+            .get::<_, Vec<Address>>(&DataKey::SupportedAssets)
+            .unwrap_or(Vec::new(&e))
+    }
+
+    /// Add an asset to the supported whitelist. Admin only.
+    pub fn add_supported_asset(e: Env, caller: Address, asset: Address) {
+        require_admin(&e, &caller);
+        let mut supported = e
+            .storage()
+            .instance()
+            .get::<_, Vec<Address>>(&DataKey::SupportedAssets)
+            .unwrap_or(Vec::new(&e));
+        // Avoid duplicates
+        let mut found = false;
+        for a in supported.iter() {
+            if a == asset {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            supported.push_back(asset);
+            e.storage().instance().set(&DataKey::SupportedAssets, &supported);
+        }
+    }
+
+    /// Remove an asset from the supported whitelist. Admin only.
+    pub fn remove_supported_asset(e: Env, caller: Address, asset: Address) {
+        require_admin(&e, &caller);
+        let supported = e
+            .storage()
+            .instance()
+            .get::<_, Vec<Address>>(&DataKey::SupportedAssets)
+            .unwrap_or(Vec::new(&e));
+        let mut out = Vec::new(&e);
+        for a in supported.iter() {
+            if a != asset {
+                out.push_back(a);
+            }
+        }
+        e.storage().instance().set(&DataKey::SupportedAssets, &out);
+    }
+
+    /// Set optional metadata for an asset (symbol, decimals). Admin only.
+    pub fn set_asset_metadata(e: Env, caller: Address, asset: Address, symbol: String, decimals: u32) {
+        require_admin(&e, &caller);
+        let meta = AssetMetadata { symbol, decimals };
+        e.storage()
+            .instance()
+            .set(&DataKey::AssetMetadata(asset), &meta);
+    }
+
+    /// Get metadata for an asset, if set.
+    pub fn get_asset_metadata(e: Env, asset: Address) -> Option<AssetMetadata> {
+        e.storage()
+            .instance()
+            .get::<_, AssetMetadata>(&DataKey::AssetMetadata(asset))
+    }
+
+    /// Get total value locked for a specific asset.
+    pub fn get_total_value_locked_by_asset(e: Env, asset: Address) -> i128 {
+        e.storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLockedByAsset(asset))
+            .unwrap_or(0)
+    }
+
+    /// Check if an asset is supported (whitelist empty = all supported).
+    pub fn is_asset_supported(e: Env, asset: Address) -> bool {
+        let supported = e
+            .storage()
+            .instance()
+            .get::<_, Vec<Address>>(&DataKey::SupportedAssets)
+            .unwrap_or(Vec::new(&e));
+        if supported.len() == 0 {
+            return true;
+        }
+        for a in supported.iter() {
+            if a == asset {
+                return true;
+            }
+        }
+        false
     }
 }
 

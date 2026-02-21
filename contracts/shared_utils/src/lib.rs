@@ -14,15 +14,18 @@
 //! - Rate limiting helpers
 
 pub mod access_control;
+pub mod batch;
 pub mod emergency;
 pub mod error_codes;
 pub mod errors;
 pub mod events;
+pub mod fees;
 pub mod math;
 pub mod rate_limiting;
 pub mod pausable;
 pub mod storage;
 pub mod time;
+pub mod validation;
 
 #[cfg(test)]
 mod tests;
@@ -36,3 +39,7 @@ pub use events::*;
 pub use math::*;
 pub use rate_limiting::*;
 pub use pausable::*;
+pub use batch::*;
+pub use storage::*;
+pub use time::*;
+pub use validation::*;

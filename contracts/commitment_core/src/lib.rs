@@ -195,39 +195,41 @@ fn require_admin(e: &Env, caller: &Address) {
 }
 
 /// Pause the contract
-    /// 
-    /// # Arguments
-    /// * `e` - The environment
-    /// 
-    /// # Panics
-    /// Panics if caller is not admin or if contract is already paused
-    pub fn pause(e: Env) {
-        require_admin(&e, &e.caller());
-        Pausable::pause(&e);
-    }
+///
+/// # Arguments
+/// * `e` - The environment
+/// * `caller` - The caller address (must be admin)
+///
+/// # Panics
+/// Panics if caller is not admin or if contract is already paused
+pub fn pause(e: &Env, caller: &Address) {
+    require_admin(e, caller);
+    Pausable::pause(e);
+}
 
-    /// Unpause the contract
-    /// 
-    /// # Arguments
-    /// * `e` - The environment
-    /// 
-    /// # Panics
-    /// Panics if caller is not admin or if contract is already unpaused
-    pub fn unpause(e: Env) {
-        require_admin(&e, &e.caller());
-        Pausable::unpause(&e);
-    }
+/// Unpause the contract
+///
+/// # Arguments
+/// * `e` - The environment
+/// * `caller` - The caller address (must be admin)
+///
+/// # Panics
+/// Panics if caller is not admin or if contract is already unpaused
+pub fn unpause(e: &Env, caller: &Address) {
+    require_admin(e, caller);
+    Pausable::unpause(e);
+}
 
-    /// Check if the contract is paused
-    /// 
-    /// # Arguments
-    /// * `e` - The environment
-    /// 
-    /// # Returns
-    /// `true` if paused, `false` otherwise
-    pub fn is_paused(e: Env) -> bool {
-        Pausable::is_paused(&e)
-    }
+/// Check if the contract is paused
+///
+/// # Arguments
+/// * `e` - The environment
+///
+/// # Returns
+/// `true` if paused, `false` otherwise
+pub fn is_paused(e: &Env) -> bool {
+    Pausable::is_paused(e)
+}
 
 #[contract]
 pub struct CommitmentCoreContract;

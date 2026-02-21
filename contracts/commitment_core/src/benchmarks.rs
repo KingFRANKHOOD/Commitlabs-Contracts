@@ -253,3 +253,4 @@ fn benchmark_batch_create_commitments() {
 
     metrics.print_summary();
 }
+

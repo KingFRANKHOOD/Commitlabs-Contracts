@@ -25,6 +25,7 @@ pub enum CommitmentError {
     InvalidStatus = 13,
     NotInitialized = 14,
     NotExpired = 15,
+    AlreadySettled = 16,
 }
 
 impl CommitmentError {
@@ -46,6 +47,7 @@ impl CommitmentError {
             CommitmentError::InvalidStatus => "Invalid commitment status for this operation",
             CommitmentError::NotInitialized => "Contract not initialized",
             CommitmentError::NotExpired => "Commitment has not expired yet",
+            CommitmentError::AlreadySettled => "Commitment has already been settled",
         }
     }
 }
@@ -54,6 +56,19 @@ impl CommitmentError {
 fn fail(e: &Env, err: CommitmentError, context: &str) -> ! {
     emit_error_event(e, err as u32, context);
     panic!("{}", err.message());
+}
+
+/// Grace period after `expires_at` during which anyone may trigger settlement (1 hour).
+const GRACE_PERIOD_SECONDS: u64 = 3600;
+
+/// Event emitted when a commitment is successfully settled.
+#[contracttype]
+#[derive(Clone)]
+pub struct CommitmentSettledEvent {
+    pub commitment_id: String,
+    pub owner: Address,
+    pub settlement_amount: i128,
+    pub timestamp: u64,
 }
 
 #[contracttype]
@@ -147,6 +162,23 @@ fn call_nft_mint(
 }
 
 // Storage helpers
+
+/// Remove a commitment ID from the owner's active commitment list.
+fn remove_from_owner_commitments(e: &Env, owner: &Address, commitment_id: &String) {
+    let mut list = e
+        .storage()
+        .instance()
+        .get::<_, Vec<String>>(&DataKey::OwnerCommitments(owner.clone()))
+        .unwrap_or(Vec::new(e));
+
+    if let Some(idx) = list.iter().position(|id| &id == commitment_id) {
+        list.remove(idx as u32);
+        e.storage()
+            .instance()
+            .set(&DataKey::OwnerCommitments(owner.clone()), &list);
+    }
+}
+
 fn read_commitment(e: &Env, commitment_id: &String) -> Option<Commitment> {
     e.storage()
         .instance()
@@ -651,12 +683,17 @@ impl CommitmentCoreContract {
         (has_violations, loss_violated, duration_violated, loss_percent, time_remaining)
     }
 
-    /// Settle commitment at maturity
-    /// 
+    /// Settle a commitment at or after maturity.
+    ///
+    /// # Access Control
+    /// Permissionless — anyone may call `settle()` on an expired commitment.
+    /// The commitment must have reached `expires_at` (plus the 1-hour grace
+    /// period) and must still be in `active` status.
+    ///
     /// # Reentrancy Protection
     /// Uses checks-effects-interactions pattern with reentrancy guard.
     pub fn settle(e: Env, commitment_id: String) {
-// Reentrancy protection
+        // Reentrancy protection
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
 
@@ -670,43 +707,57 @@ impl CommitmentCoreContract {
                 fail(&e, CommitmentError::CommitmentNotFound, "settle")
             });
 
-        // Verify commitment is expired
+        // Verify commitment is expired (current_time >= expires_at).
+        // Settlement is valid from expires_at up through expires_at + grace period.
         let current_time = e.ledger().timestamp();
         if current_time < commitment.expires_at {
             set_reentrancy_guard(&e, false);
             fail(&e, CommitmentError::NotExpired, "settle");
         }
 
-        // Verify commitment is active
+        // Verify commitment is still active (guards against double-settlement).
         let active_status = String::from_str(&e, "active");
+        let settled_status = String::from_str(&e, "settled");
+        if commitment.status == settled_status {
+            set_reentrancy_guard(&e, false);
+            fail(&e, CommitmentError::AlreadySettled, "settle");
+        }
         if commitment.status != active_status {
             set_reentrancy_guard(&e, false);
             fail(&e, CommitmentError::NotActive, "settle");
         }
 
-        // EFFECTS: Update state before external calls
+        // EFFECTS: Update state before external calls (checks-effects-interactions).
         let settlement_amount = commitment.current_value;
-        commitment.status = String::from_str(&e, "settled");
+        let owner = commitment.owner.clone();
+        commitment.status = settled_status;
         set_commitment(&e, &commitment);
 
-        // Decrease total value locked
+        // Remove this commitment from the owner's active commitment list.
+        remove_from_owner_commitments(&e, &owner, &commitment_id);
+
+        // Decrease total value locked.
         let current_tvl = e
             .storage()
             .instance()
             .get::<_, i128>(&DataKey::TotalValueLocked)
             .unwrap_or(0);
-        let new_tvl = current_tvl - settlement_amount;
+        let new_tvl = if current_tvl > settlement_amount {
+            current_tvl - settlement_amount
+        } else {
+            0
+        };
         e.storage()
             .instance()
             .set(&DataKey::TotalValueLocked, &new_tvl);
 
-        // INTERACTIONS: External calls (token transfer, NFT settlement)
-        // Transfer assets back to owner
+        // INTERACTIONS: External calls (token transfer, NFT settlement).
+        // Transfer assets back to owner.
         let contract_address = e.current_contract_address();
         let token_client = token::Client::new(&e, &commitment.asset_address);
-        token_client.transfer(&contract_address, &commitment.owner, &settlement_amount);
+        token_client.transfer(&contract_address, &owner, &settlement_amount);
 
-        // Call NFT contract to mark NFT as settled
+        // Call NFT contract to mark NFT as settled.
         let nft_contract = e
             .storage()
             .instance()
@@ -715,18 +766,19 @@ impl CommitmentCoreContract {
                 set_reentrancy_guard(&e, false);
                 fail(&e, CommitmentError::NotInitialized, "settle")
             });
-        
+
         let mut args = Vec::new(&e);
         args.push_back(commitment.nft_token_id.into_val(&e));
         e.invoke_contract::<()>(&nft_contract, &Symbol::new(&e, "settle"), args);
 
-        // Clear reentrancy guard
+        // Clear reentrancy guard.
         set_reentrancy_guard(&e, false);
 
-        // Emit settlement event
+        // Emit CommitmentSettled event with full context.
+        let timestamp = e.ledger().timestamp();
         e.events().publish(
-            (symbol_short!("Settled"), commitment_id),
-            (settlement_amount, e.ledger().timestamp()),
+            (symbol_short!("Settled"), commitment_id.clone(), owner.clone()),
+            (settlement_amount, timestamp),
         );
     }
 

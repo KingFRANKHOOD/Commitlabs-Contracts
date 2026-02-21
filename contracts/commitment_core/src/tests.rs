@@ -1277,3 +1277,245 @@ fn test_early_exit_status_transition() {
     
     assert_eq!(before.status, String::from_str(&e, "active"));
 }
+
+// ============================================================================
+// Mock Contracts for Settlement Integration Tests
+// ============================================================================
+
+#[contract]
+pub struct MockTokenContract;
+
+#[contractimpl]
+impl MockTokenContract {
+    pub fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) {}
+    pub fn balance(_e: Env, _id: Address) -> i128 { 1000000 }
+}
+
+#[contract]
+pub struct MockNftContract;
+
+#[contractimpl]
+impl MockNftContract {
+    pub fn mint(_e: Env, _owner: Address, _commitment_id: String, _duration_days: u32, _max_loss_percent: u32, _commitment_type: String, _initial_amount: i128, _asset_address: Address) -> u32 { 1 }
+    pub fn settle(_e: Env, _token_id: u32) {}
+}
+
+// Helper to setup environment and register mock token/nft
+fn setup_settlement_test(e: &Env) -> (Address, Address, Address, Address, String) {
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let owner = Address::generate(e);
+    let admin = Address::generate(e);
+    let token_address = e.register_contract(None, MockTokenContract);
+    let nft_contract = e.register_contract(None, MockNftContract);
+    
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
+    });
+    
+    let commitment_id = String::from_str(e, "test_settle");
+    
+    (contract_id, owner, token_address, nft_contract, commitment_id)
+}
+
+// ============================================================================
+// Settlement Tests
+// ============================================================================
+
+#[test]
+fn test_settle_successful_at_maturity() {
+    let e = Env::default();
+    let (contract_id, owner, token_address, _nft_contract, commitment_id) = setup_settlement_test(&e);
+    
+    let created_at = 1000u64;
+    let duration_days = 30u32;
+    let expires_at = created_at + (duration_days as u64 * 86400);
+    
+    let mut commitment = create_test_commitment(&e, "test_settle", &owner, 1000, 1000, 10, duration_days, created_at);
+    commitment.asset_address = token_address.clone();
+    store_commitment(&e, &contract_id, &commitment);
+    
+    // Fast forward to maturity
+    e.ledger().with_mut(|l| { l.timestamp = expires_at; });
+    
+    // Execute settle
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::settle(e.clone(), commitment_id.clone());
+    });
+    
+    // Verify status updated to settled
+    let updated = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_commitment(e.clone(), commitment_id.clone())
+    });
+    assert_eq!(updated.status, String::from_str(&e, "settled"));
+}
+
+#[test]
+fn test_settle_within_grace_period() {
+    let e = Env::default();
+    let (contract_id, owner, token_address, _nft_contract, commitment_id) = setup_settlement_test(&e);
+    
+    let created_at = 1000u64;
+    let duration_days = 30u32;
+    let expires_at = created_at + (duration_days as u64 * 86400);
+    
+    let mut commitment = create_test_commitment(&e, "test_settle", &owner, 1000, 1000, 10, duration_days, created_at);
+    commitment.asset_address = token_address.clone();
+    store_commitment(&e, &contract_id, &commitment);
+    
+    // Fast forward to within grace period (expires_at + 1800 seconds)
+    e.ledger().with_mut(|l| { l.timestamp = expires_at + 1800; });
+    
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::settle(e.clone(), commitment_id.clone());
+    });
+    
+    let updated = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_commitment(e.clone(), commitment_id.clone())
+    });
+    assert_eq!(updated.status, String::from_str(&e, "settled"));
+}
+
+#[test]
+#[should_panic(expected = "Commitment has not expired yet")]
+fn test_settle_not_expired_fails() {
+    let e = Env::default();
+    let (contract_id, owner, token_address, _nft_contract, commitment_id) = setup_settlement_test(&e);
+    
+    let created_at = 1000u64;
+    let duration_days = 30u32;
+    let expires_at = created_at + (duration_days as u64 * 86400);
+    
+    let mut commitment = create_test_commitment(&e, "test_settle", &owner, 1000, 1000, 10, duration_days, created_at);
+    commitment.asset_address = token_address;
+    store_commitment(&e, &contract_id, &commitment);
+    
+    // Fast forward, but not enough (expires_at - 1)
+    e.ledger().with_mut(|l| { l.timestamp = expires_at - 1; });
+    
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::settle(e.clone(), commitment_id.clone());
+    });
+}
+
+#[test]
+#[should_panic(expected = "Commitment has already been settled")]
+fn test_settle_already_settled_fails() {
+    let e = Env::default();
+    let (contract_id, owner, token_address, _nft_contract, commitment_id) = setup_settlement_test(&e);
+    
+    let mut commitment = create_test_commitment(&e, "test_settle", &owner, 1000, 1000, 10, 30, 1000);
+    commitment.asset_address = token_address;
+    commitment.status = String::from_str(&e, "settled"); // already settled
+    store_commitment(&e, &contract_id, &commitment);
+    
+    e.ledger().with_mut(|l| { l.timestamp = commitment.expires_at; });
+    
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::settle(e.clone(), commitment_id.clone());
+    });
+}
+
+#[test]
+#[should_panic(expected = "Commitment not found")]
+fn test_settle_commitment_not_found_fails() {
+    let e = Env::default();
+    let (contract_id, _owner, _token_address, _nft_contract, _commitment_id) = setup_settlement_test(&e);
+    
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::settle(e.clone(), String::from_str(&e, "unknown_id"));
+    });
+}
+
+#[test]
+fn test_settle_event_fields() {
+    let e = Env::default();
+    let (contract_id, owner, token_address, _nft_contract, commitment_id) = setup_settlement_test(&e);
+    
+    let mut commitment = create_test_commitment(&e, "test_settle", &owner, 1000, 1000, 10, 30, 1000);
+    commitment.asset_address = token_address;
+    store_commitment(&e, &contract_id, &commitment);
+    
+    e.ledger().with_mut(|l| { l.timestamp = commitment.expires_at; });
+    
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::settle(e.clone(), commitment_id.clone());
+    });
+    
+    let events = e.events().all();
+    let last_event = events.last().unwrap();
+    
+    assert_eq!(last_event.0, contract_id);
+    assert_eq!(
+        last_event.1,
+        vec![
+            &e,
+            symbol_short!("Settled").into_val(&e),
+            commitment_id.clone().into_val(&e),
+            owner.into_val(&e)
+        ]
+    );
+    
+    let data: (i128, u64) = last_event.2.into_val(&e);
+    assert_eq!(data.0, 1000); // settlement_amount
+    assert_eq!(data.1, commitment.expires_at); // timestamp
+}
+
+#[test]
+fn test_settle_updates_tvl() {
+    let e = Env::default();
+    let (contract_id, owner, token_address, _nft_contract, commitment_id) = setup_settlement_test(&e);
+    
+    let mut commitment = create_test_commitment(&e, "test_settle", &owner, 1000, 1000, 10, 30, 1000);
+    commitment.asset_address = token_address;
+    store_commitment(&e, &contract_id, &commitment);
+    
+    e.as_contract(&contract_id, || {
+        e.storage().instance().set(&DataKey::TotalValueLocked, &2500i128);
+    });
+    
+    e.ledger().with_mut(|l| { l.timestamp = commitment.expires_at; });
+    
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::settle(e.clone(), commitment_id.clone());
+    });
+    
+    let final_tvl = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_total_value_locked(e.clone())
+    });
+    
+    assert_eq!(final_tvl, 1500i128); // 2500 - 1000
+}
+
+#[test]
+fn test_settle_removes_from_owner_list() {
+    let e = Env::default();
+    let (contract_id, owner, token_address, _nft_contract, commitment_id) = setup_settlement_test(&e);
+    
+    let mut commitment = create_test_commitment(&e, "test_settle", &owner, 1000, 1000, 10, 30, 1000);
+    commitment.asset_address = token_address;
+    store_commitment(&e, &contract_id, &commitment);
+    
+    let other_id = String::from_str(&e, "other_commitment");
+    
+    e.as_contract(&contract_id, || {
+        let mut list = Vec::new(&e);
+        list.push_back(commitment_id.clone());
+        list.push_back(other_id.clone());
+        e.storage().instance().set(&DataKey::OwnerCommitments(owner.clone()), &list);
+    });
+    
+    e.ledger().with_mut(|l| { l.timestamp = commitment.expires_at; });
+    
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::settle(e.clone(), commitment_id.clone());
+    });
+    
+    // Verify removal
+    let list = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone())
+    });
+    
+    assert_eq!(list.len(), 1);
+    assert_eq!(list.get(0).unwrap(), other_id);
+}

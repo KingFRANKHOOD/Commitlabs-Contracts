@@ -16,8 +16,8 @@ fn setup_contract(e: &Env) -> (Address, CommitmentNFTContractClient<'_>) {
     (admin, client)
 }
 
-/// Setup contract with a registered "core" contract so settle() can be called (access control).
-/// Returns (admin, client, core_contract_id). Use e.as_contract(&core_id, || { client.settle(&core_id, &token_id) }) to settle.
+/// Setup contract with a registered "core" contract.
+/// Returns (admin, client, core_contract_id).
 fn setup_contract_with_core(e: &Env) -> (Address, CommitmentNFTContractClient<'_>, Address) {
     e.mock_all_auths();
     let (admin, client) = setup_contract(e);
@@ -450,9 +450,7 @@ fn test_total_supply_unchanged_after_transfer_and_settle() {
     e.ledger().with_mut(|li| {
         li.timestamp = 172800;
     });
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id);
-    });
+    client.settle(&token_id);
     assert_eq!(client.total_supply(), 1);
     client.transfer(&owner1, &owner2, &token_id);
     assert_eq!(client.total_supply(), 1);
@@ -542,9 +540,7 @@ fn test_balance_of_decremented_after_transfer() {
     e.ledger().with_mut(|li| {
         li.timestamp = 172800;
     });
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id);
-    });
+    client.settle(&token_id);
     client.transfer(&owner, &recipient, &token_id);
     assert_eq!(client.balance_of(&owner), 0);
     assert_eq!(client.balance_of(&recipient), 1);
@@ -707,13 +703,11 @@ fn test_transfer() {
     assert_eq!(client.balance_of(&owner1), 1);
     assert_eq!(client.balance_of(&owner2), 0);
 
-    // Fast forward time past expiration and settle (as core contract)
+    // Fast forward time past expiration and settle.
     e.ledger().with_mut(|li| {
         li.timestamp = 172800; // 2 days
     });
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id);
-    });
+    client.settle(&token_id);
 
     // Verify NFT is now inactive (unlocked)
     assert_eq!(client.is_active(&token_id), false);
@@ -885,10 +879,8 @@ fn test_transfer_after_settlement() {
         li.timestamp = 172800;
     });
 
-    // Settle the NFT (as core contract)
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id);
-    });
+    // Settle the NFT after expiry
+    client.settle(&token_id);
 
     // Verify NFT is now inactive (unlocked)
     assert_eq!(client.is_active(&token_id), false);
@@ -936,10 +928,8 @@ fn test_settle() {
     // Verify it's expired
     assert_eq!(client.is_expired(&token_id), true);
 
-    // Settle the NFT (as authorized core contract)
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id);
-    });
+    // Settle the NFT after expiry
+    client.settle(&token_id);
 
     // NFT should now be inactive
     assert_eq!(client.is_active(&token_id), false);
@@ -980,10 +970,8 @@ fn test_settle_not_expired() {
         &5,
     );
 
-    // Try to settle before expiration (as core, should fail with NotExpired)
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id);
-    });
+    // Try to settle before expiration, should fail with NotExpired
+    client.settle(&token_id);
 }
 
 #[test]
@@ -1010,46 +998,12 @@ fn test_settle_already_settled() {
         li.timestamp = 172800;
     });
 
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id);
-    });
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id); // Should fail
-    });
-}
-
-// ============================================
-// Issue #108: NFT settle access control
-// ============================================
-
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")] // NotAuthorized
-fn test_settle_by_random_address_fails() {
-    let e = Env::default();
-    let (_admin, client, _core_id) = setup_contract_with_core(&e);
-    let owner = Address::generate(&e);
-    let asset_address = Address::generate(&e);
-
-    let token_id = client.mint(
-        &owner,
-        &String::from_str(&e, "test_commitment"),
-        &1,
-        &10,
-        &String::from_str(&e, "safe"),
-        &1000,
-        &asset_address,
-        &5,
-    );
-    e.ledger().with_mut(|li| {
-        li.timestamp = 172800;
-    });
-    // Call settle with a random address (not core or admin) — expect NotAuthorized
-    let random_address = Address::generate(&e);
-    client.settle(&random_address, &token_id);
+    client.settle(&token_id);
+    client.settle(&token_id); // Should fail
 }
 
 #[test]
-fn test_settle_by_core_contract_succeeds() {
+fn test_settle_succeeds_after_expiry() {
     let e = Env::default();
     let (_admin, client, core_id) = setup_contract_with_core(&e);
     let owner = Address::generate(&e);
@@ -1068,9 +1022,7 @@ fn test_settle_by_core_contract_succeeds() {
     e.ledger().with_mut(|li| {
         li.timestamp = 172800;
     });
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id);
-    });
+    client.settle(&token_id);
     assert_eq!(client.is_active(&token_id), false);
 }
 
@@ -1264,15 +1216,13 @@ fn test_balance_updates_after_transfer() {
     assert_eq!(client.balance_of(&owner1), 3);
     assert_eq!(client.balance_of(&owner2), 0);
 
-    // Fast forward time past expiration and settle all NFTs (as core contract)
+    // Fast forward time past expiration and settle all NFTs.
     e.ledger().with_mut(|li| {
         li.timestamp = 172800; // 2 days
     });
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &0);
-        client.settle(&core_id, &1);
-        client.settle(&core_id, &2);
-    });
+    client.settle(&0);
+    client.settle(&1);
+    client.settle(&2);
 
     // Transfer one NFT
     client.transfer(&owner1, &owner2, &0);
@@ -1370,9 +1320,7 @@ fn _test_unpause_restores_transfer() {
     e.ledger().with_mut(|li| {
         li.timestamp = 172800;
     });
-    e.as_contract(&core_id, || {
-        client.settle(&core_id, &token_id);
-    });
+    client.settle(&token_id);
 
     client.pause();
     client.unpause();

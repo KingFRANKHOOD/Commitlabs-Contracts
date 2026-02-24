@@ -286,6 +286,36 @@ fn test_initialize_twice_fails() {
 }
 
 #[test]
+#[should_panic]
+fn test_create_commitment_without_initialize_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let owner = Address::generate(&e);
+    let asset_address = setup_token_contract(&e);
+
+    let rules = CommitmentRules {
+        duration_days: 30,
+        max_loss_percent: 10,
+        commitment_type: String::from_str(&e, "safe"),
+        early_exit_penalty: 5,
+        min_fee_threshold: 100,
+        grace_period_days: 0,
+    };
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::create_commitment(
+            e.clone(),
+            owner.clone(),
+            1000,
+            asset_address.clone(),
+            rules.clone(),
+        );
+    });
+}
+
+#[test]
 fn test_create_commitment_valid() {
     let e = Env::default();
     let contract_id = e.register_contract(None, CommitmentCoreContract);
@@ -724,6 +754,79 @@ fn test_get_nft_contract() {
         CommitmentCoreContract::get_nft_contract(e.clone())
     });
     assert_eq!(retrieved_nft_contract, nft_contract);
+}
+
+#[test]
+#[should_panic]
+fn test_get_admin_not_initialized_fails() {
+    let e = Env::default();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_admin(e.clone());
+    });
+}
+
+#[test]
+#[should_panic]
+fn test_get_nft_contract_not_initialized_fails() {
+    let e = Env::default();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_nft_contract(e.clone());
+    });
+}
+
+#[test]
+fn test_get_owner_commitments_not_initialized_returns_empty() {
+    let e = Env::default();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let owner = Address::generate(&e);
+
+    let commitments = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone())
+    });
+    assert_eq!(commitments.len(), 0);
+}
+
+#[test]
+fn test_get_total_commitments_not_initialized_returns_zero() {
+    let e = Env::default();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+
+    let total = e.as_contract(&contract_id, || CommitmentCoreContract::get_total_commitments(e.clone()));
+    assert_eq!(total, 0);
+}
+
+#[test]
+fn test_get_total_value_locked_not_initialized_returns_zero() {
+    let e = Env::default();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+
+    let total_value_locked = e
+        .as_contract(&contract_id, || CommitmentCoreContract::get_total_value_locked(e.clone()));
+    assert_eq!(total_value_locked, 0);
+}
+
+#[test]
+fn test_get_allocation_contract_not_initialized_returns_none() {
+    let e = Env::default();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+
+    let allocation_contract =
+        e.as_contract(&contract_id, || CommitmentCoreContract::get_allocation_contract(e.clone()));
+    assert!(allocation_contract.is_none());
+}
+
+#[test]
+fn test_get_authorized_updaters_not_initialized_returns_empty() {
+    let e = Env::default();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+
+    let updaters =
+        e.as_contract(&contract_id, || CommitmentCoreContract::get_authorized_updaters(e.clone()));
+    assert_eq!(updaters.len(), 0);
 }
 
 #[test]

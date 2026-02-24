@@ -665,6 +665,15 @@ fn test_get_all_metadata_empty() {
 }
 
 #[test]
+fn test_get_all_metadata_not_initialized_returns_empty() {
+    let e = Env::default();
+    let (_admin, client) = setup_contract(&e);
+
+    let all_nfts = client.get_all_metadata();
+    assert_eq!(all_nfts.len(), 0);
+}
+
+#[test]
 fn test_get_all_metadata() {
     let e = Env::default();
     let (admin, client) = setup_contract(&e);
@@ -707,6 +716,16 @@ fn test_get_nfts_by_owner_empty() {
     let owner = Address::generate(&e);
 
     client.initialize(&admin);
+
+    let nfts = client.get_nfts_by_owner(&owner);
+    assert_eq!(nfts.len(), 0);
+}
+
+#[test]
+fn test_get_nfts_by_owner_not_initialized_returns_empty() {
+    let e = Env::default();
+    let (_admin, client) = setup_contract(&e);
+    let owner = Address::generate(&e);
 
     let nfts = client.get_nfts_by_owner(&owner);
     assert_eq!(nfts.len(), 0);
@@ -1545,6 +1564,23 @@ fn test_get_admin_not_initialized() {
     let (_admin, client) = setup_contract(&e);
 
     client.get_admin();
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")] // NotInitialized
+fn test_get_core_contract_not_initialized() {
+    let e = Env::default();
+    let (_admin, client) = setup_contract(&e);
+
+    client.get_core_contract();
+}
+
+#[test]
+fn test_get_version_not_initialized_returns_zero() {
+    let e = Env::default();
+    let (_admin, client) = setup_contract(&e);
+
+    assert_eq!(client.get_version(), 0);
 }
 
 // ============================================

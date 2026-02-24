@@ -559,13 +559,8 @@ impl CommitmentNFTContract {
             return Err(ContractError::NotOwner);
         }
 
-        // Check if NFT is active (locked) - active commitments cannot be transferred
-        if nft.is_active {
-            e.storage()
-                .instance()
-                .set(&DataKey::ReentrancyGuard, &false);
-            return Err(ContractError::NFTLocked);
-        }
+        // Note: Active commitments CAN be transferred (secondary market)
+        // The commitment_core contract maintains the commitment state separately
 
         // EFFECTS: Update state
         // Update owner
@@ -779,13 +774,16 @@ impl CommitmentNFTContract {
             return Err(ContractError::AlreadySettled);
         }
 
-        // Verify the commitment has expired
-        let current_time = e.ledger().timestamp();
-        if current_time < nft.metadata.expires_at {
-            e.storage()
-                .instance()
-                .set(&DataKey::ReentrancyGuard, &false);
-            return Err(ContractError::NotExpired);
+        // Only verify expiration if caller is admin (not core contract)
+        // Core contract handles its own business logic for early exit vs normal settlement
+        if caller == admin {
+            let current_time = e.ledger().timestamp();
+            if current_time < nft.metadata.expires_at {
+                e.storage()
+                    .instance()
+                    .set(&DataKey::ReentrancyGuard, &false);
+                return Err(ContractError::NotExpired);
+            }
         }
 
         // EFFECTS: Update state

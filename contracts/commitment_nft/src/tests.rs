@@ -928,7 +928,6 @@ fn test_transfer_to_self() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #19)")] // NFTLocked
 fn test_transfer_locked_nft() {
     let e = Env::default();
     e.mock_all_auths();
@@ -954,11 +953,15 @@ fn test_transfer_locked_nft() {
         &penalty,
     );
 
-    // Verify NFT is active (locked)
+    // Verify NFT is active
     assert_eq!(client.is_active(&token_id), true);
 
-    // Try to transfer active/locked NFT (should fail)
+    // Transfer active NFT (now allowed for secondary market)
     client.transfer(&owner, &recipient, &token_id);
+    
+    // Verify ownership changed
+    assert_eq!(client.owner_of(&token_id), recipient);
+    assert_eq!(client.is_active(&token_id), true); // Still active after transfer
 }
 
 #[test]
@@ -1304,8 +1307,7 @@ fn test_settle() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")] // NotExpired
-fn test_settle_not_expired() {
+fn test_settle_not_expired_by_core() {
     let e = Env::default();
     let (_admin, client, core_id) = setup_contract_with_core(&e);
     let owner = Address::generate(&e);
@@ -1322,10 +1324,13 @@ fn test_settle_not_expired() {
         &5,
     );
 
-    // Try to settle before expiration (as core, should fail with NotExpired)
+    // Core contract can settle before expiration (for early exit)
     e.as_contract(&core_id, || {
         client.settle(&core_id, &token_id);
     });
+    
+    // Verify NFT is now inactive
+    assert_eq!(client.is_active(&token_id), false);
 }
 
 #[test]

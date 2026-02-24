@@ -162,6 +162,7 @@ fn call_nft_mint(
     commitment_type: &String,
     initial_amount: i128,
     asset_address: &Address,
+    early_exit_penalty: u32,
 ) -> u32 {
     let mut args = Vec::new(e);
     args.push_back(owner.clone().into_val(e));
@@ -171,6 +172,7 @@ fn call_nft_mint(
     args.push_back(commitment_type.clone().into_val(e));
     args.push_back(initial_amount.into_val(e));
     args.push_back(asset_address.clone().into_val(e));
+    args.push_back(early_exit_penalty.into_val(e));
 
     e.invoke_contract::<u32>(nft_contract, &Symbol::new(e, "mint"), args)
 }
@@ -539,6 +541,7 @@ impl CommitmentCoreContract {
             &rules.commitment_type,
             amount,
             &asset_address,
+            rules.early_exit_penalty,
         );
 
         // Update commitment with NFT token ID

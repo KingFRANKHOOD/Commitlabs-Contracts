@@ -18,9 +18,10 @@ impl Pausable {
     /// # Returns
     /// `true` if paused, `false` otherwise
     pub fn is_paused(e: &Env) -> bool {
+        let paused_key = symbol_short!("paused");
         e.storage()
             .instance()
-            .get::<_, bool>(&Self::PAUSED_KEY)
+            .get::<_, bool>(&paused_key)
             .unwrap_or(false)
     }
 
@@ -40,7 +41,7 @@ impl Pausable {
         e.storage().instance().set(&Self::PAUSED_KEY, &true);
 
         // Emit pause event
-        Events::emit(e, Symbol::new(e, "Pause"), ());
+        Events::emit(e, symbol_short!("Pause"), ());
     }
 
     /// Unpause the contract
@@ -59,7 +60,7 @@ impl Pausable {
         e.storage().instance().set(&Self::PAUSED_KEY, &false);
 
         // Emit unpause event
-        Events::emit(e, Symbol::new(e, "Unpause"), ());
+        Events::emit(e, symbol_short!("Unpause"), ());
     }
 
     /// Modifier to require that the contract is not paused

@@ -7,9 +7,7 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
-const CURRENT_VERSION: u32 = 1;
-
-// ============================================================================
+pub const CURRENT_VERSION: u32 = 1;
 // ERROR CODES - Error Handling
 // ============================================================================
 #[contracterror]

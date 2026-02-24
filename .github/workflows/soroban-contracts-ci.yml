@@ -106,12 +106,6 @@ jobs:
           monitoring/scripts/validate_monitoring_config.sh
           echo "✓ Monitoring config validated"
 
-      - name: Validate monitoring config
-        run: |
-          chmod +x monitoring/scripts/validate_monitoring_config.sh
-          monitoring/scripts/validate_monitoring_config.sh
-          echo "✓ Monitoring config validated"
-
       - name: Run performance benchmarks
         run: |
           mkdir -p benchmarks/results

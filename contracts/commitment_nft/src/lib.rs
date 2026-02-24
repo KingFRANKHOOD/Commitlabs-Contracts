@@ -154,7 +154,8 @@ impl CommitmentNFTContract {
         e.storage().instance().set(&DataKey::TokenIds, &token_ids);
 
         // Initialize paused state (default: not paused)
-        e.storage().instance().set(&Pausable::PAUSED_KEY, &false);
+        let paused_key = symbol_short!("paused");
+        e.storage().instance().set(&paused_key, &false);
 
         Ok(())
     }

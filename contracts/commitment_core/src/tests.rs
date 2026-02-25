@@ -23,6 +23,7 @@ impl MockNftContract {
         _commitment_type: String,
         _initial_amount: i128,
         _asset_address: Address,
+        _early_exit_penalty: u32,
     ) -> u32 {
         1
     }
@@ -35,6 +36,7 @@ fn test_rules(e: &Env) -> CommitmentRules {
         commitment_type: String::from_str(e, "balanced"),
         early_exit_penalty: 5,
         min_fee_threshold: 100,
+        grace_period_days: 0,
     }
 }
 
@@ -258,6 +260,28 @@ fn test_initialize() {
     // Test successful initialization
     e.as_contract(&contract_id, || {
         CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
+    });
+}
+
+#[test]
+#[should_panic(expected = "Contract already initialized")]
+fn test_initialize_twice_fails() {
+    let e = Env::default();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+
+    let admin1 = Address::generate(&e);
+    let admin2 = Address::generate(&e);
+    let nft_contract1 = Address::generate(&e);
+    let nft_contract2 = Address::generate(&e);
+
+    // First initialization succeeds.
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin1.clone(), nft_contract1.clone());
+    });
+
+    // Second initialization must panic and must not overwrite existing config.
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin2.clone(), nft_contract2.clone());
     });
 }
 
@@ -611,6 +635,40 @@ fn test_get_owner_commitments() {
         CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone())
     });
     assert_eq!(commitments.len(), 0);
+}
+
+#[test]
+fn test_list_commitments_by_owner_matches_get_owner_commitments() {
+    let e = Env::default();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+
+    let admin = Address::generate(&e);
+    let nft_contract = Address::generate(&e);
+    let owner = Address::generate(&e);
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
+
+        // Manually seed owner commitments to avoid full token setup.
+        let ids = vec![
+            &e,
+            String::from_str(&e, "c_1"),
+            String::from_str(&e, "c_2"),
+        ];
+        e.storage()
+            .instance()
+            .set(&DataKey::OwnerCommitments(owner.clone()), &ids);
+    });
+
+    let via_get = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone())
+    });
+    let via_list = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::list_commitments_by_owner(e.clone(), owner.clone())
+    });
+
+    assert_eq!(via_get, via_list);
+    assert_eq!(via_list.len(), 2);
 }
 
 #[test]

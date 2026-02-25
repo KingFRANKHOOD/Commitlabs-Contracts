@@ -519,6 +519,14 @@ impl CommitmentCoreContract {
             .unwrap_or_else(|| fail(&e, CommitmentError::CommitmentNotFound, "get_commitment"))
     }
 
+    /// List all commitment IDs owned by the given address.
+    ///
+    /// This is a convenience wrapper around `get_owner_commitments` with a
+    /// name optimized for off-chain indexers and UIs.
+    pub fn list_commitments_by_owner(e: Env, owner: Address) -> Vec<String> {
+        Self::get_owner_commitments(e, owner)
+    }
+
     /// Get all commitments for an owner
     pub fn get_owner_commitments(e: Env, owner: Address) -> Vec<String> {
         e.storage()

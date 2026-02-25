@@ -202,14 +202,6 @@
                                   },
                                   {
                                     "key": {
-                                      "symbol": "grace_period_days"
-                                    },
-                                    "val": {
-                                      "u32": 0
-                                    }
-                                  },
-                                  {
-                                    "key": {
                                       "symbol": "max_loss_percent"
                                     },
                                     "val": {
@@ -350,6 +342,42 @@
     {
       "event": {
         "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
+              },
+              {
+                "symbol": "update_value"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "test_id"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 1100
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
         "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
         "type_": "contract",
         "body": {
@@ -367,23 +395,35 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000
-                  }
-                },
-                {
-                  "i128": {
-                    "hi": 0,
                     "lo": 1100
                   }
-                },
-                {
-                  "bool": false
                 },
                 {
                   "u64": 0
                 }
               ]
             }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "update_value"
+              }
+            ],
+            "data": "void"
           }
         }
       },
@@ -530,14 +570,6 @@
                         },
                         "val": {
                           "u32": 10
-                        }
-                      },
-                      {
-                        "key": {
-                          "symbol": "grace_period_days"
-                        },
-                        "val": {
-                          "u32": 0
                         }
                       },
                       {

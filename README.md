@@ -53,6 +53,8 @@ bash scripts/generate-docs.sh
 This command runs `cargo doc --workspace --no-deps` and **copies HTML documentation into `docs/`**.
 Open the following files in a browser for crate-specific docs:
 
+- Backend API breaking changes: [docs/backend-changelog.md](docs/backend-changelog.md)
+
 - `docs/commitment_nft/index.html`
 - `docs/commitment_core/index.html`
 - `docs/attestation_engine/index.html`

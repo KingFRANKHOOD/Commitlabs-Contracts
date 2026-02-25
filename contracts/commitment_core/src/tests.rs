@@ -1342,6 +1342,143 @@ fn test_allocate_event() {
     client.allocate(&commitment_id, &target_pool, &500);
 }
 
+#[test]
+#[should_panic(expected = "Commitment is not active")]
+fn test_allocate_when_settled_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let admin = Address::generate(&e);
+    let nft_contract = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let target_pool = Address::generate(&e);
+    let commitment_id = "allocate_settled";
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
+    });
+
+    let mut commitment =
+        create_test_commitment(&e, commitment_id, &owner, 1000, 1000, 10, 30, 1000);
+    commitment.status = String::from_str(&e, "settled");
+    store_commitment(&e, &contract_id, &commitment);
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::allocate(
+            e.clone(),
+            String::from_str(&e, commitment_id),
+            target_pool.clone(),
+            100,
+        );
+    });
+}
+
+#[test]
+#[should_panic(expected = "Commitment is not active")]
+fn test_allocate_when_violated_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let admin = Address::generate(&e);
+    let nft_contract = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let target_pool = Address::generate(&e);
+    let commitment_id = "allocate_violated";
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
+    });
+
+    let mut commitment =
+        create_test_commitment(&e, commitment_id, &owner, 1000, 1000, 10, 30, 1000);
+    commitment.status = String::from_str(&e, "violated");
+    store_commitment(&e, &contract_id, &commitment);
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::allocate(
+            e.clone(),
+            String::from_str(&e, commitment_id),
+            target_pool.clone(),
+            100,
+        );
+    });
+}
+
+#[test]
+#[should_panic(expected = "Commitment is not active")]
+fn test_allocate_when_early_exit_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let admin = Address::generate(&e);
+    let nft_contract = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let target_pool = Address::generate(&e);
+    let commitment_id = "allocate_early_exit";
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
+    });
+
+    let mut commitment =
+        create_test_commitment(&e, commitment_id, &owner, 1000, 1000, 10, 30, 1000);
+    commitment.status = String::from_str(&e, "early_exit");
+    store_commitment(&e, &contract_id, &commitment);
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::allocate(
+            e.clone(),
+            String::from_str(&e, commitment_id),
+            target_pool.clone(),
+            100,
+        );
+    });
+}
+
+#[test]
+fn test_allocate_when_active_succeeds() {
+    let e = Env::default();
+    e.mock_all_auths_allowing_non_root_auth();
+
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let client = CommitmentCoreContractClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let nft_contract = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let target_pool = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+    let commitment_id = "allocate_active";
+    let allocation_amount = 250i128;
+
+    let token_contract = e.register_stellar_asset_contract_v2(token_admin);
+    let asset_address = token_contract.address();
+    let token_admin_client = StellarAssetClient::new(&e, &asset_address);
+    token_admin_client.mint(&contract_id, &1000i128);
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
+    });
+
+    let mut commitment =
+        create_test_commitment(&e, commitment_id, &owner, 1000, 1000, 10, 30, 1000);
+    commitment.asset_address = asset_address;
+    store_commitment(&e, &contract_id, &commitment);
+
+    client.allocate(
+        &String::from_str(&e, commitment_id),
+        &target_pool,
+        &allocation_amount,
+    );
+
+    let updated = client.get_commitment(&String::from_str(&e, commitment_id));
+    assert_eq!(updated.current_value, 750);
+    assert_eq!(updated.status, String::from_str(&e, "active"));
+}
+
 /// Helper function to create a test commitment with custom penalty
 fn create_test_commitment_with_penalty(
     e: &Env,

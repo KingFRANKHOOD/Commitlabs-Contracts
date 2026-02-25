@@ -30,11 +30,12 @@ impl BenchmarkMetrics {
     }
 
     fn print_summary(&self) {
-        let gas_used = if self.gas_after > self.gas_before {
+        let _gas_used = if self.gas_after > self.gas_before {
             self.gas_after - self.gas_before
         } else {
             0
         };
+        let _ = &self.function_name;
         // Benchmark metrics collected - can be extended with proper logging
     }
 }
@@ -210,7 +211,11 @@ fn benchmark_batch_allocate() {
     let e = Env::default();
     let (contract_id, admin) = setup_test_env(&e);
 
+<<<<<<< Updated upstream
     // Register pools in separate frames
+=======
+    // Register pools
+>>>>>>> Stashed changes
     for i in 1..=5 {
         e.as_contract(&contract_id, || {
             AllocationStrategiesContract::register_pool(
@@ -225,11 +230,14 @@ fn benchmark_batch_allocate() {
         });
     }
 
-    let caller = Address::generate(&e);
     let mut metrics = BenchmarkMetrics::new("batch_allocate_10");
 
     let start = e.ledger().sequence();
     for i in 1..=10 {
+<<<<<<< Updated upstream
+=======
+        let caller = Address::generate(&e);
+>>>>>>> Stashed changes
         e.as_contract(&contract_id, || {
             let _ = AllocationStrategiesContract::allocate(
                 e.clone(),

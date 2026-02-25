@@ -17,6 +17,84 @@ use commitment_nft::CommitmentNFTContract;
 use attestation_engine::{AttestationEngineContract, AttestationError};
 use allocation_logic::{AllocationStrategiesContract, RiskLevel, Strategy};
 
+/// Verify compliance integration between commitment_core and attestation_engine.
+///
+/// This ensures that `verify_compliance` reads commitment data (rules and
+/// current_value) from `commitment_core` when deciding compliance.
+#[test]
+fn test_verify_compliance_uses_core_commitment_data() {
+    let harness = TestHarness::new();
+    let user = &harness.accounts.user1;
+    let verifier = &harness.accounts.verifier;
+    let amount: i128 = 1_000_000_000_000;
+
+    // Allow core contract to move user's tokens.
+    harness.approve_tokens(user, &harness.contracts.commitment_core, amount);
+
+    // Create commitment in core with default rules (max_loss_percent = 10).
+    let commitment_id = harness
+        .env
+        .as_contract(&harness.contracts.commitment_core, || {
+            CommitmentCoreContract::create_commitment(
+                harness.env.clone(),
+                user.clone(),
+                amount,
+                harness.contracts.token.clone(),
+                harness.default_rules(),
+            )
+        });
+
+    // Initially, with no loss recorded, commitment should be compliant.
+    let is_compliant_initial = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::verify_compliance(
+                harness.env.clone(),
+                commitment_id.clone(),
+            )
+        });
+    assert!(is_compliant_initial);
+
+    // Simulate a drawdown larger than the max_loss_percent by updating
+    // current_value in commitment_core (20% loss > 10% max).
+    let new_value = amount * 80 / 100; // 20% drawdown
+    harness
+        .env
+        .as_contract(&harness.contracts.commitment_core, || {
+            CommitmentCoreContract::update_value(
+                harness.env.clone(),
+                commitment_id.clone(),
+                new_value,
+            )
+        });
+
+    // Record a matching drawdown attestation via attestation_engine, which
+    // internally also reads rules from commitment_core.
+    harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::record_drawdown(
+                harness.env.clone(),
+                verifier.clone(),
+                commitment_id.clone(),
+                20, // 20% drawdown
+            )
+            .unwrap();
+        });
+
+    // Now verify_compliance should report non-compliance based on updated
+    // commitment_core state and health metrics.
+    let is_compliant_after = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::verify_compliance(
+                harness.env.clone(),
+                commitment_id.clone(),
+            )
+        });
+    assert!(!is_compliant_after);
+}
+
 /// Test: Commitment Core calls NFT Contract during creation
 #[test]
 fn test_commitment_core_calls_nft_on_creation() {

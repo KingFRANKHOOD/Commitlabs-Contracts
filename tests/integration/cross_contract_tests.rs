@@ -14,7 +14,7 @@ use soroban_sdk::{
 
 use commitment_core::{CommitmentCoreContract, CommitmentRules};
 use commitment_nft::CommitmentNFTContract;
-use attestation_engine::{AttestationEngineContract, AttestationError};
+use attestation_engine::{AttestationEngineContract, AttestationError, AttestationsPage};
 use allocation_logic::{AllocationStrategiesContract, RiskLevel, Strategy};
 
 /// Verify compliance integration between commitment_core and attestation_engine.
@@ -150,6 +150,62 @@ fn test_commitment_core_calls_nft_on_creation() {
     assert_eq!(nft_owner, *user);
 }
 
+/// Integration test: create_commitment mints NFT and metadata matches (#132)
+#[test]
+fn test_create_commitment_mints_nft_metadata_matches() {
+    let harness = TestHarness::new();
+    let owner = &harness.accounts.user1;
+    let amount = 5_000_000_000_000i128;
+    let asset = &harness.contracts.token;
+    let rules = CommitmentRules {
+        duration_days: 90,
+        max_loss_percent: 5,
+        commitment_type: String::from_str(&harness.env, "safe"),
+        early_exit_penalty: 3,
+        min_fee_threshold: 500,
+        grace_period_days: 0,
+    };
+
+    harness.approve_tokens(owner, &harness.contracts.commitment_core, amount);
+
+    let commitment_id = harness.create_commitment(owner, amount, asset, rules.clone());
+
+    // Assert NFT contract has one new token
+    let supply = harness
+        .env
+        .as_contract(&harness.contracts.commitment_nft, || {
+            CommitmentNFTContract::total_supply(harness.env.clone())
+        });
+    assert_eq!(supply, 1, "exactly one NFT minted");
+
+    let token_id = 0u32;
+
+    // owner_of(token_id) == owner
+    let nft_owner = harness
+        .env
+        .as_contract(&harness.contracts.commitment_nft, || {
+            CommitmentNFTContract::owner_of(harness.env.clone(), token_id).unwrap()
+        });
+    assert_eq!(nft_owner, *owner, "NFT owner must match commitment owner");
+
+    // get_metadata(token_id) matches rules and commitment
+    let nft = harness
+        .env
+        .as_contract(&harness.contracts.commitment_nft, || {
+            CommitmentNFTContract::get_metadata(harness.env.clone(), token_id).unwrap()
+        });
+
+    assert_eq!(nft.metadata.commitment_id, commitment_id);
+    assert_eq!(nft.metadata.duration_days, rules.duration_days);
+    assert_eq!(nft.metadata.max_loss_percent, rules.max_loss_percent);
+    assert_eq!(nft.metadata.commitment_type, rules.commitment_type);
+    assert_eq!(nft.metadata.initial_amount, amount);
+    assert_eq!(nft.metadata.asset_address, *asset);
+    assert_eq!(nft.token_id, token_id);
+    assert!(nft.is_active);
+    assert_eq!(nft.early_exit_penalty, rules.early_exit_penalty);
+}
+
 /// Test: Attestation Engine verifies commitment in Core Contract
 #[test]
 fn test_attestation_engine_verifies_commitment_exists() {
@@ -227,6 +283,147 @@ fn test_attestation_fails_for_nonexistent_commitment() {
 
     // Should fail with CommitmentNotFound error
     assert_eq!(result, Err(AttestationError::CommitmentNotFound));
+}
+
+/// Test: attest(...) by random address (not in verifier whitelist) → Unauthorized (#125)
+#[test]
+fn test_attest_by_random_address_fails_unauthorized() {
+    let harness = TestHarness::new();
+    let user = &harness.accounts.user1;
+    let attacker = &harness.accounts.attacker;
+    let amount = 1_000_000_000_000i128;
+
+    harness.approve_tokens(user, &harness.contracts.commitment_core, amount);
+
+    let commitment_id = harness.create_commitment(user, amount, &harness.contracts.token, harness.default_rules());
+
+    let attestation_data = harness.health_check_data();
+
+    // Attacker (not a verifier) tries to attest
+    let result = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::attest(
+                harness.env.clone(),
+                attacker.clone(),
+                commitment_id.clone(),
+                String::from_str(&harness.env, "health_check"),
+                attestation_data,
+                true,
+            )
+        });
+
+    assert_eq!(result, Err(AttestationError::Unauthorized));
+
+    // No attestation should have been stored
+    let attestations = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::get_attestations(harness.env.clone(), commitment_id)
+        });
+    assert_eq!(attestations.len(), 0);
+}
+
+/// Test: attest(...) by address in verifier whitelist → success (#125)
+#[test]
+fn test_attest_by_verifier_succeeds() {
+    let harness = TestHarness::new();
+    let user = &harness.accounts.user1;
+    let verifier = &harness.accounts.verifier;
+    let amount = 1_000_000_000_000i128;
+
+    harness.approve_tokens(user, &harness.contracts.commitment_core, amount);
+
+    let commitment_id = harness.create_commitment(user, amount, &harness.contracts.token, harness.default_rules());
+
+    let attestation_data = harness.health_check_data();
+
+    // Verifier (in whitelist) attests
+    let result = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::attest(
+                harness.env.clone(),
+                verifier.clone(),
+                commitment_id.clone(),
+                String::from_str(&harness.env, "health_check"),
+                attestation_data,
+                true,
+            )
+        });
+
+    assert!(result.is_ok());
+
+    let attestations = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::get_attestations(harness.env.clone(), commitment_id)
+        });
+    assert_eq!(attestations.len(), 1);
+}
+
+/// Test: After admin removes verifier, attest by that address → Unauthorized (#125)
+#[test]
+fn test_attest_after_verifier_removed_fails() {
+    let harness = TestHarness::new();
+    let user = &harness.accounts.user1;
+    let verifier = &harness.accounts.verifier;
+    let amount = 1_000_000_000_000i128;
+
+    harness.approve_tokens(user, &harness.contracts.commitment_core, amount);
+
+    let commitment_id = harness.create_commitment(user, amount, &harness.contracts.token, harness.default_rules());
+
+    // Verifier attests once (succeeds)
+    harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::attest(
+                harness.env.clone(),
+                verifier.clone(),
+                commitment_id.clone(),
+                String::from_str(&harness.env, "health_check"),
+                harness.health_check_data(),
+                true,
+            )
+            .unwrap();
+        });
+
+    // Admin removes verifier from whitelist
+    harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::remove_verifier(
+                harness.env.clone(),
+                harness.accounts.admin.clone(),
+                verifier.clone(),
+            )
+            .unwrap();
+        });
+
+    // Same address attests again → must fail
+    let result = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::attest(
+                harness.env.clone(),
+                verifier.clone(),
+                commitment_id.clone(),
+                String::from_str(&harness.env, "health_check"),
+                harness.health_check_data(),
+                true,
+            )
+        });
+
+    assert_eq!(result, Err(AttestationError::Unauthorized));
+
+    // Still only one attestation (the one before removal)
+    let attestations = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::get_attestations(harness.env.clone(), commitment_id)
+        });
+    assert_eq!(attestations.len(), 1);
 }
 
 /// Test: Attestation succeeds after commitment is created
@@ -353,6 +550,156 @@ fn test_multiple_attestations_cross_contract() {
         });
 
     assert_eq!(count, 3);
+}
+
+/// Test: get_attestations_page — empty list returns empty (#130)
+#[test]
+fn test_get_attestations_page_empty_returns_empty() {
+    let harness = TestHarness::new();
+    let commitment_id = String::from_str(&harness.env, "no_attestations_commitment");
+
+    let page: AttestationsPage = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::get_attestations_page(
+                harness.env.clone(),
+                commitment_id,
+                0,
+                10,
+            )
+        });
+
+    assert_eq!(page.attestations.len(), 0);
+    assert_eq!(page.next_offset, 0);
+}
+
+/// Test: get_attestations_page — single page returns all when limit >= count (#130)
+#[test]
+fn test_get_attestations_page_single_page_returns_all() {
+    let harness = TestHarness::new();
+    let user = &harness.accounts.user1;
+    let verifier = &harness.accounts.verifier;
+    let amount = 1_000_000_000_000i128;
+
+    harness.approve_tokens(user, &harness.contracts.commitment_core, amount);
+    let commitment_id = harness.create_commitment(user, amount, &harness.contracts.token, harness.default_rules());
+
+    // Add 3 attestations
+    for _ in 0..3 {
+        harness.advance_time(60);
+        harness
+            .env
+            .as_contract(&harness.contracts.attestation_engine, || {
+                AttestationEngineContract::attest(
+                    harness.env.clone(),
+                    verifier.clone(),
+                    commitment_id.clone(),
+                    String::from_str(&harness.env, "health_check"),
+                    harness.health_check_data(),
+                    true,
+                )
+                .unwrap();
+            });
+    }
+
+    let page: AttestationsPage = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::get_attestations_page(
+                harness.env.clone(),
+                commitment_id.clone(),
+                0,
+                10,
+            )
+        });
+
+    assert_eq!(page.attestations.len(), 3);
+    assert_eq!(page.next_offset, 0);
+}
+
+/// Test: get_attestations_page — multiple pages return correct chunks in order (#130)
+#[test]
+fn test_get_attestations_page_multiple_pages_correct_order() {
+    let harness = TestHarness::new();
+    let user = &harness.accounts.user1;
+    let verifier = &harness.accounts.verifier;
+    let amount = 1_000_000_000_000i128;
+
+    harness.approve_tokens(user, &harness.contracts.commitment_core, amount);
+    let commitment_id = harness.create_commitment(user, amount, &harness.contracts.token, harness.default_rules());
+
+    // Add 5 attestations
+    for _ in 0..5 {
+        harness.advance_time(60);
+        harness
+            .env
+            .as_contract(&harness.contracts.attestation_engine, || {
+                AttestationEngineContract::attest(
+                    harness.env.clone(),
+                    verifier.clone(),
+                    commitment_id.clone(),
+                    String::from_str(&harness.env, "health_check"),
+                    harness.health_check_data(),
+                    true,
+                )
+                .unwrap();
+            });
+    }
+
+    // Page 1: offset 0, limit 2
+    let page1: AttestationsPage = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::get_attestations_page(
+                harness.env.clone(),
+                commitment_id.clone(),
+                0,
+                2,
+            )
+        });
+    assert_eq!(page1.attestations.len(), 2);
+    assert_eq!(page1.next_offset, 2);
+
+    // Page 2: offset 2, limit 2
+    let page2: AttestationsPage = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::get_attestations_page(
+                harness.env.clone(),
+                commitment_id.clone(),
+                2,
+                2,
+            )
+        });
+    assert_eq!(page2.attestations.len(), 2);
+    assert_eq!(page2.next_offset, 4);
+
+    // Page 3: offset 4, limit 2
+    let page3: AttestationsPage = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::get_attestations_page(
+                harness.env.clone(),
+                commitment_id.clone(),
+                4,
+                2,
+            )
+        });
+    assert_eq!(page3.attestations.len(), 1);
+    assert_eq!(page3.next_offset, 0);
+
+    // Order: timestamps should be non-decreasing across pages
+    let all = harness
+        .env
+        .as_contract(&harness.contracts.attestation_engine, || {
+            AttestationEngineContract::get_attestations(harness.env.clone(), commitment_id)
+        });
+    assert_eq!(all.len(), 5);
+    let mut prev_ts = 0u64;
+    for att in all.iter() {
+        assert!(att.timestamp >= prev_ts);
+        prev_ts = att.timestamp;
+    }
 }
 
 /// Test: Commitment settlement triggers NFT settlement

@@ -1730,3 +1730,50 @@ fn test_update_value_triggers_violation() {
     assert!(client.check_violations(&String::from_str(&e, "test_id")));
 }
 
+#[test]
+fn test_update_value_loss_boundary_behavior() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let admin = Address::generate(&e);
+    let nft_contract = Address::generate(&e);
+    let owner = Address::generate(&e);
+
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
+        let commitment =
+            create_test_commitment(&e, "loss_boundary", &owner, 1000, 1000, 10, 30, 1000);
+        set_commitment(&e, &commitment);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalValueLocked, &1000i128);
+    });
+
+    let client = CommitmentCoreContractClient::new(&e, &contract_id);
+    let commitment_id = String::from_str(&e, "loss_boundary");
+
+    // Drawdown = max_loss_percent - 1 => no violation
+    client.update_value(&commitment_id, &910); // 9% loss
+    let has_violations = client.check_violations(&commitment_id);
+    assert!(
+        !has_violations,
+        "Loss at max_loss_percent - 1 should not violate"
+    );
+
+    // Drawdown exactly equal to max_loss_percent => defined as no violation
+    client.update_value(&commitment_id, &900); // 10% loss
+    let at_limit_violations = client.check_violations(&commitment_id);
+    assert!(
+        !at_limit_violations,
+        "Loss exactly at max_loss_percent should not violate"
+    );
+
+    // Drawdown = max_loss_percent + 1 => violation
+    client.update_value(&commitment_id, &890); // 11% loss
+    let over_limit_violations = client.check_violations(&commitment_id);
+    assert!(
+        over_limit_violations,
+        "Loss above max_loss_percent should violate"
+    );
+}
+
